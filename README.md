@@ -33,15 +33,56 @@ pi-пакет: связывает **зарегистрированные дол�
 
 (локально: `{ "source": "file:/path/to/commander" }`)
 
-## Usage
+## Быстрый старт (5 минут)
 
-1. Агенты в tmux-панях — или вообще без пней: conductor сам поднимет RPC-процессы.
-2. В основной сессии: «Зарегистрируй %12 как worker, %7 как planner, %15 как judge» → `pipeline_register` ×3. Без пней: `pipeline_register name=arch role=planner kind=tmux-auto` (conductor сам откроет пань) или `kind=rpc [model=...] [cwd=...]`.
-3. Напиши `spec.md` — шаблон в `PROTOCOL.md §spec`; **обязателен раздел «Критерии приёмки»**.
-4. «Запусти pipeline по spec.md» → `pipeline_run`. Цикл в фоне, результат — сообщением `[commander] T-...: PASS/ESCALATION`.
-5. `pipeline_status` — прогресс (все активные), `pipeline_abort [id]` — стоп, `pipeline_send` — ручное сообщение агенту, `pipeline_agents` — реестр + занятость.
+**0. Установить.** `~/.pi/agent/settings.json` → `packages` (см. Install ниже), перезапустить pi. Дальше всё через естественный язык в основной pi-сессии (в каталоге проекта).
 
-Параллельно: `pipeline_run(spec=A, agents={worker: w1, planner: p1, judge: j1})` + `pipeline_run(spec=B, agents={...другой набор...})`.
+**1. Три агента.** Либо свои пани:
+
+```
+Зарегистрируй %12 как worker, %7 как planner, %15 как judge
+```
+
+Либо вообще без пней — conductor сам откроет три пани с pi:
+
+```
+Зарегистрируй трёх агентов kind=tmux-auto: w1 — worker, p1 — planner, j1 — judge
+```
+
+Проверка: «Какие pipeline-агенты зарегистрированы?» → `pipeline_agents`, все с ✓.
+
+**2. Spec.** Файл `task.md` в проекте (или текст прямо в команде):
+
+```markdown
+## Цель — 1–3 предложения: что считается «сделано»
+## Критерии приёмки — observable-чеклист (файл/тест/поведение) ← ОБЯЗАТЕЛЬНО
+## Референсы — файлы/паттерны, на которые опираться
+## Правила — запреты
+## Границы — что НЕ входит
+```
+
+**3. Запуск.**
+
+```
+Запусти pipeline по task.md
+```
+
+Ответ: `T-2025... запущен: round 1 → worker`. Дальше цикл идёт фоном, ты свободен.
+
+**4. Результат** — придёт сообщением сам:
+
+- `[commander] T-...: PASS за 2 раунда.` → смотри diff, коммить.
+- `[commander] T-...: ESCALATION — ...` → читай `notes` в `pipeline_status`: поправь spec / перезапущай / доделай руками. Вся история — в `.pi/pipeline/<T-id>/`.
+
+**Пока задача летит:**
+
+| Скажи | Что сделает |
+|---|---|
+| «Какой статус pipeline?» | `pipeline_status` — стадия, раунд, вердикты, артефакты |
+| «Останови задачу» / «останови всё» | `pipeline_abort [id]` |
+| «Скажи worker'у: ...» | `pipeline_send` (ad-hoc) |
+
+**Параллельно:** второй набор агентов + `Запусти pipeline по spec-B.md с agents={worker: w2, planner: p2, judge: j2}`. Один репо — два набора = git worktree (judge оценивает `git diff` в своём cwd).
 
 ## Инструменты
 
