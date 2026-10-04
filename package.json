@@ -1,18 +1,24 @@
 {
   "name": "commander",
-  "version": "0.1.0",
-  "description": "pi-пакет: связывает зарегистрированные долгоживущие pi-агенты (tmux-пани) в рабочую цепочку worker→planner→judge с loop'ом по вердикту судьи",
+  "version": "0.2.0",
+  "description": "pi-пакет: связывает зарегистрированные долгоживущие pi-агенты (tmux-пани и RPC-процессы) в рабочую цепочку worker→planner→judge с loop'ом по вердикту судьи, mid-round Q&A и параллельными задачами",
   "keywords": [
     "pi-package"
   ],
   "license": "MIT",
   "type": "module",
+  "scripts": {
+    "test": "node -e \"import('jiti').then(async m => { const j = m.default(import.meta.url, { interopDefault: false }); await j.import('./test/selfcheck.ts'); const ext = await j.import('./index.ts'); ext.default({ registerTool(){} }); console.log('index loads + registers OK'); })\"",
+    "test:e2e": "node -e \"import('jiti').then(async m => { const j = m.default(import.meta.url, { interopDefault: false }); await j.import('./test/e2e.ts'); })\""
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^1.0.0",
+    "@earendil-works/pi-tui": "^1.0.0",
     "@types/node": "^22.20.5",
     "jiti": "^2.7.0",
     "typebox": "^1.3.27",
