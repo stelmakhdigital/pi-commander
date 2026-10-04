@@ -61,8 +61,12 @@ export interface TaskState {
 export const PIPELINE_DIR = (cwd: string) => path.join(cwd, ".pi", "pipeline");
 
 const STATE_FILE = "state.json";
+/** Файл-маркер abort: pipeline_abort пишет его, крутящийся runTask видит (in-memory stage не обновляется). */
+const ABORT_FILE = ".abort";
 const POLL_MS = 1500;
-const STAGE_TIMEOUT_MS = 45 * 60_000; // агентский этап может быть долгим
+/** Мягкий порог: по нему работу НЕ откатываем — уведомляем и ждём, пока агент жив.
+ *  Эскалация только по смерти агента (проверка живости каждые ~10 поллов). */
+const STAGE_TIMEOUT_MS = 45 * 60_000;
 const FIX_TIMEOUT_MS = 10 * 60_000; // «перезапиши verdict» — короткий
 const QA_TIMEOUT_MS = 15 * 60_000; // ответ planner'а на mid-round вопросы
 export const MAX_QA_PER_STAGE = 3; // worker не должен зациклиться на вопросах
@@ -186,28 +190,38 @@ export function parseVerdict(file: string): { verdict: string; issues: Issue[]; 
 
 export interface StageResult {
 	ok: boolean;
-	reason: "ok" | "timeout" | "aborted" | "qa-loop" | "no-planner" | "qa-timeout";
+	reason: "ok" | "dead" | "aborted" | "qa-loop" | "no-planner" | "qa-dead";
 }
 
-async function waitForFile(file: string, timeoutMs: number, isAborted: () => boolean): Promise<"ok" | "timeout" | "aborted"> {
-	const t0 = Date.now();
-	while (Date.now() - t0 < timeoutMs) {
-		if (isAborted()) return "aborted";
-		if (fs.existsSync(file)) return "ok";
-		await sleep(POLL_MS);
-	}
-	return "timeout";
+interface WaitDeps {
+	label: string;
+	softMs: number;
+	isAborted: () => boolean;
+	isAlive: () => boolean;
+	notify: (t: string) => void;
 }
 
-async function waitForVerdict(file: string, timeoutMs: number, isAborted: () => boolean) {
+/** Ожидание артефакта. По softMs работу не откатываем: агент жив — ждём до готовности
+ *  (одно уведомление о превышении); агент умер — "dead". */
+async function waitWhileAlive(ok: () => boolean, w: WaitDeps): Promise<"ok" | "aborted" | "dead"> {
 	const t0 = Date.now();
-	while (Date.now() - t0 < timeoutMs) {
-		if (isAborted()) return null;
-		const v = parseVerdict(file);
-		if (v) return v;
+	let warned = false;
+	let i = 0;
+	while (true) {
+		if (w.isAborted()) return "aborted";
+		if (ok()) return "ok";
+		if (i++ % 10 === 0 && !w.isAlive()) return "dead";
+		if (!warned && Date.now() - t0 >= w.softMs) {
+			warned = true;
+			w.notify(`[commander] ${w.label}: мягкие ${Math.round(w.softMs / 60000)} мин прошли, артефакта нет — агент работает, жду до готовности`);
+		}
 		await sleep(POLL_MS);
 	}
-	return null;
+}
+
+async function waitForVerdict(file: string, w: WaitDeps) {
+	const r = await waitWhileAlive(() => parseVerdict(file) !== null, w);
+	return r === "ok" ? parseVerdict(file) : null;
 }
 
 export interface LoopDeps {
@@ -223,13 +237,15 @@ export interface LoopDeps {
  * шлёт planner'у, ждёт answered-<k>, пересылает worker'у answers-<k>.md.
  */
 export async function waitForStage(task: TaskState, role: Role, rd: string, deps: LoopDeps): Promise<StageResult> {
-	const aborted = () => task.stage === "aborted";
+	const aborted = () => fs.existsSync(path.join(task.dir, ABORT_FILE));
 	const marker = path.join(rd, `done-${role}`);
 	const askBase = path.join(rd, "ask-worker.md");
 	const worker = deps.agents.find((a) => a.role === "worker");
 	let qa = 0;
+	let warned = false;
+	let i = 0;
 	const t0 = Date.now();
-	while (Date.now() - t0 < STAGE_TIMEOUT_MS) {
+	while (true) {
 		if (aborted()) return { ok: false, reason: "aborted" };
 		if (fs.existsSync(marker)) return { ok: true, reason: "ok" };
 		if (role === "worker" && fs.existsSync(askBase)) {
@@ -246,20 +262,30 @@ export async function waitForStage(task: TaskState, role: Role, rd: string, deps
 				planner,
 				`[pipeline ${task.id} R${task.round} → planner Q&A] Worker ждёт решения. Вопросы: ${ask}. Ответь на каждый пункт (read-only, код не трогай), запиши в ${answers} и сделай финальный шаг: создать ${doneQa}.`,
 			);
-			const wq = await waitForFile(doneQa, QA_TIMEOUT_MS, aborted);
-			if (wq !== "ok") return { ok: false, reason: wq === "aborted" ? "aborted" : "qa-timeout" };
+			const wq = await waitWhileAlive(() => fs.existsSync(doneQa), {
+				label: `${task.id} Q&A-${k} (planner ${planner.name})`,
+				softMs: QA_TIMEOUT_MS,
+				isAborted: aborted,
+				isAlive: () => deps.alive(planner),
+				notify: deps.notify,
+			});
+			if (wq !== "ok") return { ok: false, reason: wq === "aborted" ? "aborted" : "qa-dead" };
 			if (worker) await deps.sendTo(worker, `[pipeline ${task.id} R${task.round} → worker] Ответы архитектора: ${answers}. Продолжи задачу, финальный шаг без изменений.`);
+		}
+		if (i++ % 10 === 0 && (!worker || !deps.alive(worker))) return { ok: false, reason: "dead" };
+		if (!warned && Date.now() - t0 >= STAGE_TIMEOUT_MS) {
+			warned = true;
+			deps.notify(`[commander] ${task.id}: worker не сделал финальный шаг за ${STAGE_TIMEOUT_MS / 60000} мин — работаю, жду до готовности`);
 		}
 		await sleep(POLL_MS);
 	}
-	return { ok: false, reason: "timeout" };
 }
 
 /** Полный цикл задачи. Fire-and-forget: вызывается из pipeline_run, результат — через notify. */
 export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 	const { agents, sendTo, alive, notify } = deps;
 	const agentFor = (role: Role) => agents.find((a) => a.role === role);
-	const aborted = () => task.stage === "aborted";
+	const aborted = () => fs.existsSync(path.join(task.dir, ABORT_FILE));
 	const escalate = (reason: string) => {
 		task.stage = "escalated";
 		task.notes = reason;
@@ -286,28 +312,31 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 			let w: StageResult;
 			if (role === "worker") w = await waitForStage(task, role, rd, deps);
 			else {
-				const r = await waitForFile(path.join(rd, `done-${role}`), STAGE_TIMEOUT_MS, aborted);
+				const r = await waitWhileAlive(() => fs.existsSync(path.join(rd, `done-${role}`)), {
+					label: `${task.id} ${role} ${agent.name}`, softMs: STAGE_TIMEOUT_MS, isAborted: aborted, isAlive: () => alive(agent), notify,
+				});
 				w = { ok: r === "ok", reason: r };
 			}
 			if (!w.ok) {
 				if (w.reason === "aborted") return;
 				const reasons: Record<string, string> = {
-					timeout: `таймаут ${STAGE_TIMEOUT_MS / 60000} мин: ${agent.name} не сделал финальный шаг (done-${role})`,
+					dead: `агент ${agent.name} (${role}): мёртв (панель/процесс пропал)`,
 					"qa-loop": `worker зациклится на вопросах (> ${MAX_QA_PER_STAGE} Q&A за этап)`,
 					"no-planner": "worker ждёт ответа, но planner недоступен",
-					"qa-timeout": `таймаут ${QA_TIMEOUT_MS / 60000} мин: planner не ответил на mid-round вопросы`,
+					"qa-dead": "planner умер во время ответа на mid-round вопросы",
 				};
 				return escalate(reasons[w.reason]);
 			}
 
 			if (role === "judge") {
 				const vf = path.join(rd, "judge-verdict.json");
-				let v = parseVerdict(vf) ?? (await waitForVerdict(vf, FIX_TIMEOUT_MS, aborted));
+				const wv = { label: `${task.id} judge ${agent.name}`, softMs: FIX_TIMEOUT_MS, isAborted: aborted, isAlive: () => alive(agent), notify };
+				let v = parseVerdict(vf) ?? (await waitForVerdict(vf, wv));
 				if (!v) {
 					// один запрос на переписывание, повторное ожидание
 					await sendTo(agent, `[pipeline ${task.id}] ${vf} невалидный JSON. Перезапиши по шаблону PROTOCOL.md §judge (verdict + issues).`);
-					v = await waitForVerdict(vf, FIX_TIMEOUT_MS, aborted);
-					if (!v) return escalate("судья не выдал валидный judge-verdict.json после повторного запроса");
+					v = await waitForVerdict(vf, wv);
+					if (!v) return escalate("судья не выдал валидный judge-verdict.json (агент умер)");
 				}
 				task.history.push({ round: task.round, verdict: v.verdict, issues: v.issues, notes: v.notes });
 				saveState(task);

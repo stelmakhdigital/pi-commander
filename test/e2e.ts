@@ -73,4 +73,17 @@ assert.ok(fs.existsSync(path.join(dir, "round-1", "ask-worker-1.md")), "ask-фа
 assert.ok(fs.existsSync(path.join(dir, "round-1", "answers-1.md")), "ответы на диске");
 assert.ok(fs.existsSync(path.join(dir, "round-2", "judge-verdict.json")), "вердикт R2");
 assert.ok(notified.some((t) => t.includes("PASS за 2 раунд")), "notify: PASS");
+
+// abort: файл .abort останавливает крутящийся цикл (in-memory stage не меняется tool'ом)
+const dir2 = path.join(cwd, "T-abort");
+fs.mkdirSync(path.join(dir2, "round-1"), { recursive: true });
+const t2: TaskState = { id: "T-abort", dir: dir2, base_head: null, round: 1, stage: "worker", max_rounds: 1, history: [], agents: { worker: "w" }, started_at: "" };
+const p2 = runTask(t2, {
+	agents: [{ name: "w", role: "worker", surface: { kind: "tmux", target: "%9" } }],
+	sendTo: () => {}, alive: () => true, notify: () => {},
+});
+await new Promise((r) => setTimeout(r, 2000)); // worker «работает» (done-файла нет)
+fs.writeFileSync(path.join(dir2, ".abort"), "");
+await Promise.race([p2, new Promise((_, rej) => setTimeout(() => rej(new Error("abort не сработал")), 10_000))]);
+console.log("e2e abort: OK");
 console.log("e2e: OK (" + sent.length + " сообщений, " + task.history.map((h) => h.verdict).join("→") + ")");

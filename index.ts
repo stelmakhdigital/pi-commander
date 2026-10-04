@@ -64,16 +64,6 @@ export default function commander(pi: ExtensionAPI) {
 		rpc.prompt(line);
 	};
 
-	const problems = (cwd: string): string[] => {
-		const reg = loadRegistry(cwd);
-		return ROLES.flatMap((r) => {
-			const a = reg.agents.find((x) => x.role === r);
-			if (!a) return [`нет агента с ролью ${r} (pipeline_register)`];
-			if (!alive(a)) return [`агент ${a.name} (${r}): не жив`];
-			return [];
-		});
-	};
-
 	const ensureProtocol = (cwd: string): string => {
 		const root = PIPELINE_DIR(cwd);
 		fs.mkdirSync(root, { recursive: true });
@@ -154,7 +144,8 @@ export default function commander(pi: ExtensionAPI) {
 
 			const root = PIPELINE_DIR(cwd);
 			ensureProtocol(cwd);
-			const id = `T-${new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14)}`;
+			let id = `T-${new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14)}`;
+			while (fs.existsSync(path.join(root, id))) id += "x"; // параллельный запуск в ту же секунду
 			const dir = path.join(root, id);
 			fs.mkdirSync(path.join(dir, "round-1"), { recursive: true });
 			fs.writeFileSync(path.join(dir, "spec.md"), specText.trimEnd() + "\n");
@@ -342,6 +333,7 @@ export default function commander(pi: ExtensionAPI) {
 			const targets = p.id ? [readState(cwd, p.id)].filter((t): t is TaskState => !!t) : findActiveTasks(cwd);
 			if (!targets.length) return text(p.id ? `Задача ${p.id} не найдена или не активна.` : "Активных задач нет.");
 			for (const t of targets) {
+				fs.writeFileSync(path.join(t.dir, ".abort"), ""); // крутящийся runTask видит по файлу
 				t.stage = "aborted";
 				saveState(t);
 			}
