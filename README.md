@@ -43,7 +43,21 @@ pi-пакет: связывает **зарегистрированные дол�
 Зарегистрируй %12 как worker, %7 как planner, %15 как judge
 ```
 
-Либо вообще без панелей — conductor сам откроет три панели с pi:
+`%12`, `%7`… — это **pane id** (номера панелей tmux), не придуманные номера. Узнать их — одна команда в любой панели (или за tmux):
+
+```bash
+tmux list-panes -s -F "#{pane_id}  #{pane_current_path}  #{pane_current_command}"
+```
+
+```
+%5   /home/you/Code/myproj   pi      ← вот тут живёт будущий worker
+%9   /home/you/Code/myproj   pi
+%14  /home/you/Code/other    bash
+```
+
+Берёшь `pane_id` (первая колонка) тех панелей, где запущены pi-сессии агентов. Подсказка: сам tmux показывает id в статус-баре (включить: `tmux set -g status-right '#{pane_id} '`), и по префиксу (`Ctrl+b`) → `?` видны клавиши управления панелями.
+
+А если агентов пока нет — ничего искать не нужно, conductor сам откроет панели с pi и id запомнит:
 
 ```
 Зарегистрируй трёх агентов kind=tmux-auto: w1 — worker, p1 — planner, j1 — judge
