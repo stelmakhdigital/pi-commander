@@ -25,7 +25,9 @@ export function isAlive(pane: string): boolean {
 
 /** Новая detached-панель, запускающая command (например `pi '<bootstrap>'`). Возвращает pane id. */
 export function createPane(sourcePane: string, command?: string): string {
-	const out = tmux("split-window", "-d", "-h", "-t", sourcePane, "-P", "-F", "#{pane_id}", ...(command ? [command] : []));
+	const out = tmux("split-window", "-d", "-t", sourcePane, "-P", "-F", "#{pane_id}", ...(command ? [command] : []));
 	if (!out.startsWith("%")) throw new Error(`unexpected tmux output: ${out}`);
+	// Равномерная пересборка: иначе каждый split берёт половину предыдущей панели.
+	tmux("select-layout", "-t", sourcePane, "tiled");
 	return out;
 }
