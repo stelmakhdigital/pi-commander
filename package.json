@@ -1,0 +1,26 @@
+{
+  "name": "commander",
+  "version": "0.1.0",
+  "description": "pi-пакет: связывает зарегистрированные долгоживущие pi-агенты (tmux-пани) в рабочую цепочку worker→planner→judge с loop'ом по вердикту судьи",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.0.0",
+    "@types/node": "^22.20.5",
+    "jiti": "^2.7.0",
+    "typebox": "^1.3.27",
+    "typescript": "^5.9.3"
+  },
+  "pi": {
+    "extensions": [
+      "index.ts"
+    ]
+  }
+}
