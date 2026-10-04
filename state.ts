@@ -10,7 +10,7 @@ import path from "node:path";
 export type Role = "worker" | "planner" | "judge";
 export const ROLES: Role[] = ["worker", "planner", "judge"];
 
-/** Где живёт агент: tmux-пань (чужая живая сессия) или RPC-процесс под управлением conductor'а. */
+/** Где живёт агент: tmux-панель (чужая живая сессия) или RPC-процесс под управлением conductor'а. */
 export type Surface =
 	| { kind: "tmux"; target: string }
 	| { kind: "rpc"; model?: string; cwd?: string };

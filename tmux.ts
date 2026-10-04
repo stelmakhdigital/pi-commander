@@ -1,4 +1,4 @@
-/** Минимальный tmux-слой: строка в пань, живость, создание паней. */
+/** Минимальный tmux-слой: строка в панель, живость, создание панелей. */
 import { execFileSync } from "node:child_process";
 
 export function tmux(...args: string[]): string {
@@ -7,7 +7,7 @@ export function tmux(...args: string[]): string {
 
 /**
  * Только ОДНА строка: многострочный ввод ломает TUI (каждый \n = отправка).
- * Многострочный контент кладётся в brief-файл, в пань — строка-указатель.
+ * Многострочный контент кладётся в brief-файл, в панель — строка-указатель.
  */
 export function sendLine(pane: string, line: string): void {
 	tmux("send-keys", "-t", pane, "-l", line.replace(/\n/g, " "));
@@ -23,7 +23,7 @@ export function isAlive(pane: string): boolean {
 	}
 }
 
-/** Новая detached-пань, запускающая command (например `pi '<bootstrap>'`). Возвращает pane id. */
+/** Новая detached-панель, запускающая command (например `pi '<bootstrap>'`). Возвращает pane id. */
 export function createPane(sourcePane: string, command?: string): string {
 	const out = tmux("split-window", "-d", "-h", "-t", sourcePane, "-P", "-F", "#{pane_id}", ...(command ? [command] : []));
 	if (!out.startsWith("%")) throw new Error(`unexpected tmux output: ${out}`);

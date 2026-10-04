@@ -1,7 +1,7 @@
 /** Контракт протокола — пишется в .pi/pipeline/PROTOCOL.md и bootstrap'ится в агентов. */
 export const PROTOCOL = `# PROTOCOL — pipeline worker → planner → judge
 
-Conductor (pi-расширение commander) шлёт в tmux-пани сообщения вида
+Conductor (pi-расширение commander) шлёт в tmux-панели сообщения вида
 \`[pipeline T-id R-n → роль] Прочитай <brief-файл> и выполни...\`.
 Задачи из цепочки узнавай по префиксу \`[pipeline\` — остальное может быть
 личным разговором пользователя.
