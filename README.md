@@ -4,9 +4,10 @@ pi-пакет: связывает **зарегистрированные дол�
 
 ## Модель
 
-- **Агенты** — живые pi-сессии, два транспорта:
+- **Агенты** — живые pi-сессии, три способа:
   - `tmux` — твоя уже запущенная pi-сессия в tmux-пане (conductor пишет `send-keys`);
-  - `rpc` — `pi --mode rpc`, дочерний процесс, поднятый conductor'ом (JSONL-протокол).
+  - `tmux-auto` — conductor сам открывает пань с `pi` (bootstrap улетает стартовым промптом, без гонок таймингов); агент виден, переживает рестарт conductor'а;
+  - `rpc` — `pi --mode rpc`, дочерний процесс conductor'а (JSONL-протокол).
 - **Conductor** — это расширение в твоей основной pi-сессии. Детерминированный TS state machine, без LLM. Для tmux — одна строка-указатель на brief-файл (многострочный ввод ломал бы TUI); для RPC — prompt по JSONL.
 - **Сигнал готовности** этапа = done-файл на диске (часть протокола, а не транспорта) + валидный артефакт.
 - **Mid-round Q&A**: worker застрял без решения архитектора → `round-N/ask-worker.md` → conductor ретранслирует planner'у → `answers-<k>.md` → worker продолжает. Лимит 3 Q&A/этап (против зацикливания).
@@ -35,7 +36,7 @@ pi-пакет: связывает **зарегистрированные дол�
 ## Usage
 
 1. Агенты в tmux-панях — или вообще без пней: conductor сам поднимет RPC-процессы.
-2. В основной сессии: «Зарегистрируй %12 как worker, %7 как planner, %15 как judge» → `pipeline_register` ×3. Для RPC: `pipeline_register name=architect role=planner kind=rpc [model=...]`.
+2. В основной сессии: «Зарегистрируй %12 как worker, %7 как planner, %15 как judge» → `pipeline_register` ×3. Без пней: `pipeline_register name=arch role=planner kind=tmux-auto` (conductor сам откроет пань) или `kind=rpc [model=...] [cwd=...]`.
 3. Напиши `spec.md` — шаблон в `PROTOCOL.md §spec`; **обязателен раздел «Критерии приёмки»**.
 4. «Запусти pipeline по spec.md» → `pipeline_run`. Цикл в фоне, результат — сообщением `[commander] T-...: PASS/ESCALATION`.
 5. `pipeline_status` — прогресс (все активные), `pipeline_abort [id]` — стоп, `pipeline_send` — ручное сообщение агенту, `pipeline_agents` — реестр + занятость.
@@ -58,6 +59,11 @@ pi-пакет: связывает **зарегистрированные дол�
 `round: worker → planner → judge → pass | revise (round N+1) | blocked (к тебе)`.
 Эскалация: `max_rounds` (default 3), **cycle-detect** (findings двух раундов >50% совпадают), Q&A-loop (>3 вопросов за этап), Q&A-таймаут (15 мин), таймаут этапа (45 мин), мёртвый агент, невалидный verdict судьи после повторного запроса.
 
+## Рестарты conductor'а
+- **RPC-агенты**: lazy auto-respawn — при первом обращении мёртвый агент из реестра поднимается заново: `--session-dir` изолирован на агента, `--continue` — агент помнит прошлые задачи. Без перерегистрации.
+- **Задачи, застрявшие в активной стадии** при рестарте: автоматически `escalated: conductor перезапустился` (state.json жив — перезапусти или доделай руками).
+- **tmux/tmux-auto пани**: живы, пока жив tmux-сервер; registry хранит pane id.
+
 ## Layout
 
 `.pi/pipeline/` — `registry.json`, `PROTOCOL.md`, `<T-id>/{spec.md, state.json, round-N/{brief-*, *report/decision/verdict, ask-worker-*, answers-*, done-*}}`.
@@ -70,4 +76,4 @@ pi-пакет: связывает **зарегистрированные дол�
 
 - Одна роль в задаче — один агент; параллельность — через разные наборы.
 - Q&A только worker→planner (mid-round); у planner/judge вопросы — end-of-round через артефакты.
-- RPC-агенты живут пока жива сессия conductor'а; перезапуск сессии требует перерегистрации.
+- RPC-агент при respawn продолжает свою последнюю сессию (--continue в его session-dir). Если «память» вредна — перерегистрируй с новым именем (чистый session-dir).

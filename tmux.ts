@@ -1,4 +1,4 @@
-/** Минимальный tmux-слой: одна строка в пань + проверка живости. */
+/** Минимальный tmux-слой: строка в пань, живость, создание паней. */
 import { execFileSync } from "node:child_process";
 
 export function tmux(...args: string[]): string {
@@ -21,4 +21,11 @@ export function isAlive(pane: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/** Новая detached-пань, запускающая command (например `pi '<bootstrap>'`). Возвращает pane id. */
+export function createPane(sourcePane: string, command?: string): string {
+	const out = tmux("split-window", "-d", "-h", "-t", sourcePane, "-P", "-F", "#{pane_id}", ...(command ? [command] : []));
+	if (!out.startsWith("%")) throw new Error(`unexpected tmux output: ${out}`);
+	return out;
 }

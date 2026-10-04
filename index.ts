@@ -23,23 +23,44 @@ import {
 	type Role,
 	type TaskState,
 } from "./state.ts";
-import { isAlive as tmuxAlive, sendLine } from "./tmux.ts";
+import { isAlive as tmuxAlive, createPane, sendLine } from "./tmux.ts";
 import { PROTOCOL } from "./protocol.ts";
 
 export default function commander(pi: ExtensionAPI) {
 	const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: undefined });
 
+	/** Задачи, застрявшие в активной стадии из-за рестарта conductor'а → честная эскалация. */
+	try {
+		for (const t of findActiveTasks(process.cwd())) {
+			t.stage = "escalated";
+			t.notes = "conductor перезапустился во время задачи — перезапусти (состояние: state.json)";
+			saveState(t);
+		}
+	} catch {}
+
 	/** RPC-агенты живут в памяти сессии conductor'а (имена → процесс). */
 	const rpcAgents = new Map<string, RpcAgent>();
 
+	/** Lazy auto-respawn: мёртвый rpc-агент из реестра поднимается заново с --continue
+	 * (память в его собственном session-dir), если процесс уже был в этой сессии. */
+	const ensureRpc = (a: Agent, cwd: string): void => {
+		if (a.surface.kind !== "rpc") return;
+		if (rpcAgents.get(a.name)?.alive) return;
+		const sessionDir = path.join(PIPELINE_DIR(cwd), "rpc", a.name, "sessions");
+		fs.mkdirSync(sessionDir, { recursive: true });
+		const hadBefore = rpcAgents.has(a.name);
+		rpcAgents.set(a.name, new RpcAgent({ cwd: a.surface.cwd ?? cwd, model: a.surface.model, sessionDir, resume: hadBefore }));
+	};
+
 	const alive = (a: Agent) => (a.surface.kind === "tmux" ? tmuxAlive(a.surface.target) : rpcAgents.get(a.name)?.alive ?? false);
-	const sendTo = (a: Agent, line: string) => {
+	const sendTo = (a: Agent, line: string, cwd: string) => {
 		if (a.surface.kind === "tmux") {
 			sendLine(a.surface.target, line);
 			return;
 		}
+		ensureRpc(a, cwd);
 		const rpc = rpcAgents.get(a.name);
-		if (!rpc?.alive) throw new Error(`rpc-агент ${a.name} мёртв`);
+		if (!rpc?.alive) throw new Error(`rpc-агент ${a.name} не поднялся (lastError: ${rpc?.lastError ?? "?"})`);
 		rpc.prompt(line);
 	};
 
@@ -77,6 +98,7 @@ export default function commander(pi: ExtensionAPI) {
 		for (const r of ROLES) {
 			const name = sel?.[r];
 			const a = name ? reg.agents.find((x) => x.name === name) : reg.agents.find((x) => x.role === r);
+			if (a && a.surface.kind === "rpc") ensureRpc(a, cwd);
 			if (!a) {
 				problems.push(name ? `агент «${name}» не найден в реестре (роль ${r})` : `нет агента с ролью ${r} (pipeline_register)`);
 				continue;
@@ -118,9 +140,8 @@ export default function commander(pi: ExtensionAPI) {
 		}),
 		async execute(_id, p, _signal, _u, ctx) {
 			const cwd = ctx.cwd || process.cwd();
-			const prob = resolveAgents(cwd, p.agents).problems;
-			if (prob.length) return text("Pipeline не запущен:\n- " + prob.join("\n- "));
-			const { agents } = resolveAgents(cwd, p.agents);
+			const { agents, problems } = resolveAgents(cwd, p.agents);
+			if (problems.length) return text("Pipeline не запущен:\n- " + problems.join("\n- "));
 			const busy = busyAgents(cwd);
 			const conflicts = agents.filter((a) => busy.has(a.name)).map((a) => `${a.name} занят: ${busy.get(a.name)}`);
 			if (conflicts.length) return text("Не запущен — агенты заняты в другой активной задаче:\n- " + conflicts.join("\n- ") + "\nДождись завершения или задай другой набор (agents={...}).");
@@ -156,7 +177,7 @@ export default function commander(pi: ExtensionAPI) {
 			};
 			fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify(task, null, 2));
 
-			runTask(task, { agents, sendTo, alive, notify }).catch((err) => notify(`[commander] ${id}: ОШИБКА: ${(err as Error)?.message ?? err}`));
+			runTask(task, { agents, sendTo: (a, line) => sendTo(a, line, cwd), alive, notify }).catch((err) => notify(`[commander] ${id}: ОШИБКА: ${(err as Error)?.message ?? err}`));
 
 			const who = agents.map((a) => `${a.role}=${a.name}(${surfaceStr(a)})`).join(", ");
 			return text(`${id} запущен: round 1 → worker. Агенты: ${who}. Прогресс: pipeline_status. Результат придёт сообщением.`);
@@ -208,11 +229,11 @@ export default function commander(pi: ExtensionAPI) {
 		name: "pipeline_register",
 		label: "pipeline_register",
 		description:
-			"Зарегистрировать pipeline-агента и отправить bootstrap. kind=tmux (default): существующая pi-сессия в tmux-пане (pane). kind=rpc: conductor поднимет `pi --mode rpc` (model, cwd опциональны). Разрешено несколько агентов на роль (для параллельных задач).",
+			"Зарегистрировать pipeline-агента и отправить bootstrap. kind=tmux (default): существующая pi-сессия в tmux-пане (pane). kind=tmux-auto: conductor сам откроет пань с pi и bootstrap-промптом. kind=rpc: conductor поднимет `pi --mode rpc` (model, cwd опциональны). Разрешено несколько агентов на роль (для параллельных задач).",
 		parameters: Type.Object({
 			name: Type.String({ description: "Имя агента" }),
 			role: Type.String({ description: "Роль: worker | planner | judge" }),
-			kind: Type.Optional(Type.Union([Type.Literal("tmux"), Type.Literal("rpc")], { description: "default: tmux" })),
+			kind: Type.Optional(Type.Union([Type.Literal("tmux"), Type.Literal("tmux-auto"), Type.Literal("rpc")], { description: "default: tmux; tmux-auto = conductor сам откроет пань с pi" })),
 			pane: Type.Optional(Type.String({ description: "tmux-пань, например %12 (kind=tmux)" })),
 			model: Type.Optional(Type.String({ description: "модель (kind=rpc)" })),
 			cwd: Type.Optional(Type.String({ description: "рабочий каталог (kind=rpc; default: каталог проекта)" })),
@@ -227,6 +248,16 @@ export default function commander(pi: ExtensionAPI) {
 				if (!p.pane) return text("Для kind=tmux нужен pane (например %12).");
 				if (!tmuxAlive(p.pane)) return text(`Пань ${p.pane} не найден (tmux list-panes: проверь номер).`);
 				surface = { kind: "tmux", target: p.pane };
+			} else if (kind === "tmux-auto") {
+				const source = process.env.TMUX_PANE;
+				if (!source) return text("tmux-auto: pi не запущен внутри tmux (нет $TMUX_PANE). Возьми kind=tmux (свой пань) или kind=rpc.");
+				try {
+					const boot = `[pipeline] Ты агент ${p.name} в pipeline, роль: ${role}. Прочитай ${ensureProtocol(cwd)} (раздел «${role}» + общие правила + §Q&A) и ответь одним словом «готов». Задачи будут приходить как [pipeline T-... R-n → ${role}].`;
+					const pane = createPane(source, `pi '${boot}'`);
+					surface = { kind: "tmux", target: pane };
+				} catch (e) {
+					return text(`Не удалось открыть пань: ${(e as Error).message}`);
+				}
 			} else {
 				try {
 					rpcAgents.get(p.name)?.kill();
@@ -242,6 +273,7 @@ export default function commander(pi: ExtensionAPI) {
 			saveRegistry(cwd, reg);
 			const proto = ensureProtocol(cwd);
 			const line = `[pipeline] Ты агент ${p.name} в pipeline, роль: ${role}. Прочитай ${proto} (раздел «${role}» + общие правила + §Q&A) и ответь одним словом «готов». Задачи будут приходить как [pipeline T-... R-n → ${role}].`;
+			// tmux-auto: bootstrap уже ушёл стартовым промптом пани, повторно не шлём
 			if (kind === "tmux") sendLine(p.pane!, line);
 			else rpcAgents.get(p.name)?.prompt(line);
 			return text(`Зарегистрирован: ${p.name} (${role}, ${surfaceStr({ name: p.name, role, surface })}). Bootstrap отправлен — проверь ответ «готов».`);
@@ -288,8 +320,9 @@ export default function commander(pi: ExtensionAPI) {
 			const cwd = ctx.cwd || process.cwd();
 			const a = loadRegistry(cwd).agents.find((x) => x.name === p.name);
 			if (!a) return text(`Агент «${p.name}» не найден в реестре.`);
+			if (a.surface.kind === "rpc") ensureRpc(a, cwd);
 			if (!alive(a)) return text(`Агент ${p.name}: не жив.`);
-			await sendTo(a, p.message);
+			await sendTo(a, p.message, cwd);
 			return text(`Отправлено в ${p.name} (${surfaceStr(a)}).`);
 		},
 		renderCall(args, theme) {
