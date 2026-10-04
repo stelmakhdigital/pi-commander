@@ -23,6 +23,15 @@ export function isAlive(pane: string): boolean {
 	}
 }
 
+/** Новая detached-панель в окне conductor'а, запускающая command (например `pi '<bootstrap>'`).
+ *  Возвращает pane id. Равномерная пересборка: иначе каждый split берёт половину предыдущей панели. */
+export function createPane(sourcePane: string, command?: string): string {
+	const out = tmux("split-window", "-d", "-t", sourcePane, "-P", "-F", "#{pane_id}", ...(command ? [command] : []));
+	if (!out.startsWith("%")) throw new Error(`unexpected tmux output: ${out}`);
+	tmux("select-layout", "-t", sourcePane, "tiled");
+	return out;
+}
+
 /** Новое detached-окно в той же сессии, запускающее command (например `pi '<bootstrap>'`).
  *  Имя окна = name. Возвращает id единственной панели окна. */
 export function createWindow(sourcePane: string, name: string, command?: string): string {

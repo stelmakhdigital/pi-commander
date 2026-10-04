@@ -23,7 +23,7 @@ import {
 	type Role,
 	type TaskState,
 } from "./state.ts";
-import { isAlive as tmuxAlive, createWindow, sendLine } from "./tmux.ts";
+import { isAlive as tmuxAlive, createWindow, createPane, sendLine } from "./tmux.ts";
 import { PROTOCOL } from "./protocol.ts";
 
 export default function commander(pi: ExtensionAPI) {
@@ -220,11 +220,11 @@ export default function commander(pi: ExtensionAPI) {
 		name: "pipeline_register",
 		label: "pipeline_register",
 		description:
-			"Зарегистрировать pipeline-агента и отправить bootstrap. kind=tmux (default): существующая pi-сессия в tmux-пане (pane). kind=tmux-auto: conductor сам откроет панель с pi и bootstrap-промптом. kind=rpc: conductor поднимет `pi --mode rpc` (model, cwd опциональны). Разрешено несколько агентов на роль (для параллельных задач).",
+			"Зарегистрировать pipeline-агента и отправить bootstrap. kind=tmux (default): существующая pi-сессия в tmux-пане (pane). kind=tmux-auto: conductor сам откроет отдельное окно с pi. kind=tmux-split: откроет split-панель в окне conductor'а (все агенты видны сразу). kind=rpc: conductor поднимет `pi --mode rpc` (model, cwd опциональны). Разрешено несколько агентов на роль (для параллельных задач).",
 		parameters: Type.Object({
 			name: Type.String({ description: "Имя агента" }),
 			role: Type.String({ description: "Роль: worker | planner | judge" }),
-			kind: Type.Optional(Type.Union([Type.Literal("tmux"), Type.Literal("tmux-auto"), Type.Literal("rpc")], { description: "default: tmux; tmux-auto = conductor сам откроет панель с pi" })),
+			kind: Type.Optional(Type.Union([Type.Literal("tmux"), Type.Literal("tmux-auto"), Type.Literal("tmux-split"), Type.Literal("rpc")], { description: "default: tmux; tmux-auto = отдельное окно, tmux-split = плитка в окне conductor'а" })),
 			pane: Type.Optional(Type.String({ description: "tmux-панель, например %12 (kind=tmux)" })),
 			model: Type.Optional(Type.String({ description: "модель (kind=rpc)" })),
 			cwd: Type.Optional(Type.String({ description: "рабочий каталог (kind=rpc; default: каталог проекта)" })),
@@ -239,15 +239,15 @@ export default function commander(pi: ExtensionAPI) {
 				if (!p.pane) return text("Для kind=tmux нужен pane (например %12).");
 				if (!tmuxAlive(p.pane)) return text(`Панель ${p.pane} не найдена (tmux list-panes: проверь номер).`);
 				surface = { kind: "tmux", target: p.pane };
-			} else if (kind === "tmux-auto") {
+			} else if (kind === "tmux-auto" || kind === "tmux-split") {
 				const source = process.env.TMUX_PANE;
-				if (!source) return text("tmux-auto: pi не запущен внутри tmux (нет $TMUX_PANE). Возьми kind=tmux (свою панель) или kind=rpc.");
+				if (!source) return text("tmux-auto/split: pi не запущен внутри tmux (нет $TMUX_PANE). Возьми kind=tmux (свою панель) или kind=rpc.");
 				try {
 					const boot = `[pipeline] Ты агент ${p.name} в pipeline, роль: ${role}. Прочитай ${ensureProtocol(cwd)} (раздел «${role}» + общие правила + §Q&A) и ответь одним словом «готов». Задачи будут приходить как [pipeline T-... R-n → ${role}].`;
-					const pane = createWindow(source, p.name, `pi '${boot}'`);
+					const pane = kind === "tmux-auto" ? createWindow(source, p.name, `pi '${boot}'`) : createPane(source, `pi '${boot}'`);
 					surface = { kind: "tmux", target: pane };
 				} catch (e) {
-					return text(`Не удалось открыть панель: ${(e as Error).message}`);
+					return text(`Не удалось открыть окно/панель: ${(e as Error).message}`);
 				}
 			} else {
 				try {
