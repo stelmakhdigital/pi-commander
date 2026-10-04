@@ -23,7 +23,7 @@ import {
 	type Role,
 	type TaskState,
 } from "./state.ts";
-import { isAlive as tmuxAlive, createPane, sendLine } from "./tmux.ts";
+import { isAlive as tmuxAlive, createWindow, sendLine } from "./tmux.ts";
 import { PROTOCOL } from "./protocol.ts";
 
 export default function commander(pi: ExtensionAPI) {
@@ -244,7 +244,7 @@ export default function commander(pi: ExtensionAPI) {
 				if (!source) return text("tmux-auto: pi не запущен внутри tmux (нет $TMUX_PANE). Возьми kind=tmux (свою панель) или kind=rpc.");
 				try {
 					const boot = `[pipeline] Ты агент ${p.name} в pipeline, роль: ${role}. Прочитай ${ensureProtocol(cwd)} (раздел «${role}» + общие правила + §Q&A) и ответь одним словом «готов». Задачи будут приходить как [pipeline T-... R-n → ${role}].`;
-					const pane = createPane(source, `pi '${boot}'`);
+					const pane = createWindow(source, p.name, `pi '${boot}'`);
 					surface = { kind: "tmux", target: pane };
 				} catch (e) {
 					return text(`Не удалось открыть панель: ${(e as Error).message}`);

@@ -23,11 +23,14 @@ export function isAlive(pane: string): boolean {
 	}
 }
 
-/** Новая detached-панель, запускающая command (например `pi '<bootstrap>'`). Возвращает pane id. */
-export function createPane(sourcePane: string, command?: string): string {
-	const out = tmux("split-window", "-d", "-t", sourcePane, "-P", "-F", "#{pane_id}", ...(command ? [command] : []));
-	if (!out.startsWith("%")) throw new Error(`unexpected tmux output: ${out}`);
-	// Равномерная пересборка: иначе каждый split берёт половину предыдущей панели.
-	tmux("select-layout", "-t", sourcePane, "tiled");
-	return out;
+/** Новое detached-окно в той же сессии, запускающее command (например `pi '<bootstrap>'`).
+ *  Имя окна = name. Возвращает id единственной панели окна. */
+export function createWindow(sourcePane: string, name: string, command?: string): string {
+	// new-window требует окно/сессию, не панель — берём session id панели.
+	const session = tmux("display-message", "-p", "-t", sourcePane, "#{session_id}");
+	const wid = tmux("new-window", "-d", "-t", session, "-n", name, "-P", "-F", "#{window_id}", ...(command ? [command] : []));
+	if (!wid.startsWith("@")) throw new Error(`unexpected tmux output: ${wid}`);
+	const pane = tmux("list-panes", "-t", wid, "-F", "#{pane_id}").split("\n")[0].trim();
+	if (!pane.startsWith("%")) throw new Error(`unexpected pane id: ${pane}`);
+	return pane;
 }
