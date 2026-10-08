@@ -9,5 +9,5 @@
     "allowImportingTsExtensions": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "state.ts", "tmux.ts", "registry.ts", "protocol.ts", "test/selfcheck.ts"]
+  "include": ["index.ts", "state.ts", "tmux.ts", "registry.ts", "protocol.ts", "templates.ts", "test/selfcheck.ts", "test/e2e-slices.ts"]
 }

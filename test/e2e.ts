@@ -13,6 +13,7 @@ const task: TaskState = {
 	id: "T-e2e",
 	dir,
 	base_head: null,
+	cwd,
 	round: 1,
 	stage: "worker",
 	max_rounds: 3,
@@ -77,7 +78,7 @@ assert.ok(notified.some((t) => t.includes("PASS за 2 раунд")), "notify: P
 // abort: файл .abort останавливает крутящийся цикл (in-memory stage не меняется tool'ом)
 const dir2 = path.join(cwd, "T-abort");
 fs.mkdirSync(path.join(dir2, "round-1"), { recursive: true });
-const t2: TaskState = { id: "T-abort", dir: dir2, base_head: null, round: 1, stage: "worker", max_rounds: 1, history: [], agents: { worker: "w" }, started_at: "" };
+const t2: TaskState = { id: "T-abort", dir: dir2, base_head: null, cwd, round: 1, stage: "worker", max_rounds: 1, history: [], agents: { worker: "w" }, started_at: "" };
 const p2 = runTask(t2, {
 	agents: [{ name: "w", role: "worker", surface: { kind: "tmux", target: "%9" } }],
 	sendTo: () => {}, alive: () => true, notify: () => {},

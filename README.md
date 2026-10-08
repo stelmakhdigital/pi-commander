@@ -12,16 +12,21 @@ pi-пакет: связывает **зарегистрированные дол�
 - **Conductor** — это расширение в твоей основной pi-сессии. Детерминированный TS state machine, без LLM. Для tmux — одна строка-указатель на brief-файл (многострочный ввод ломал бы TUI); для RPC — prompt по JSONL.
 - **Сигнал готовности** этапа = done-файл на диске (часть протокола, а не транспорта) + валидный артефакт.
 - **Mid-round Q&A**: worker застрял без решения архитектора → `round-N/ask-worker.md` → conductor ретранслирует planner'у → `answers-<k>.md` → worker продолжает. Лимит 3 Q&A/этап (против зацикливания).
-- **Параллельные задачи**: у каждой задачи свой набор агентов (`agents={worker, planner, judge}`), конфликт-чек по занятым агентам. Параллельные задачи в одном репо — на совести пользователя (git worktree / отдельные каталоги; judge оценивает `git diff` в своём cwd).
+- **Параллельность, три уровня:**
+  1. *Внутри раунда* — planner и judge не зависят друг от друга и работают одновременно (раунд = worker + max(planner, judge)).
+  2. *Между задачами* — агенты заняты? Задача встаёт в очередь (`stage=queued`) и стартует автоматически, как только её набор агентов освобождается (FIFO-планировщик). У каждой задачи свой набор агентов (`agents={worker, planner, judge}`).
+  3. *Внутри задачи (slices)* — `pipeline_run(spec, slices=N)`: planner дробит spec на 2..N независимых слайсов (`slices.json`), conductor поднимает под каждый слайс отдельного воркера в **git worktree** — все работают параллельно; conductor merge-ит слайсы, judge оценивает итоговый diff. Раунды 2+ (revise) — обычные. Требуется: git + чистое дерево + rpc-воркер (slice-воркеры conductor поднимает сам). Merge-конфликт — эскалация (worktrees остаются для ручного разрешения).
 - **Артефакты и контракты** — `.pi/pipeline/PROTOCOL.md` (пишется автоматически, bootstrap'ится в агентов при регистрации).
 
 ```
-Ты ── pipeline_run(spec, agents?) ──► CONDUCTOR (extension, state machine)
-                                        │ round N: worker → planner → judge
+Ты ── pipeline_run(spec, agents?, slices?) ──► CONDUCTOR (extension, state machine)
+                                        │ round N: worker → (planner ∥ judge)
    tmux pane %12 ◄─send-keys───────────┤    (каждый: brief → артефакт → done-файл)
    rpc proc (pi --mode rpc) ◄─JSONL────┤    (worker может mid-round спросить planner'а)
    tmux pane %7  ◄──────────────────────┘    pass → готово
                                              revise → round N+1 | blocked / max_rounds / cycle / Q&A-loop → эскалация
+                                             sliced: round 1 = decompose → N worker'ов в worktrees → merge
+                                             занятые агенты → очередь (старт при освобождении)
 ```
 
 ## Install
@@ -84,6 +89,9 @@ tmux list-panes -s -F "#{pane_id}  #{pane_current_path}  #{pane_current_command}
 
 Ответ: `T-2025... запущен: round 1 → worker`. Дальше цикл идёт фоном, ты свободен.
 
+- Та же команда при занятых агентах: `T-... поставлен в очередь` — стартует автоматически, когда набор освободится.
+- Большая задача с независимыми кусками: `Запусти pipeline по task.md с slices=3` (fan-out в git worktrees; нужен git + чистое дерево + rpc-воркер).
+
 **4. Результат** — придёт сообщением сам:
 
 - `[commander] T-...: PASS за 2 раунда.` → смотри diff, коммить.
@@ -97,14 +105,34 @@ tmux list-panes -s -F "#{pane_id}  #{pane_current_path}  #{pane_current_command}
 | «Останови задачу» / «останови всё» | `pipeline_abort [id]` |
 | «Скажи worker'у: ...» | `pipeline_send` (ad-hoc) |
 
-**Параллельно:** второй набор агентов + `Запусти pipeline по spec-B.md с agents={worker: w2, planner: p2, judge: j2}`. Один репо — два набора = git worktree (judge оценивает `git diff` в своём cwd).
+**Параллельно:** второй набор агентов + `Запусти pipeline по spec-B.md с agents={worker: w2, planner: p2, judge: j2}`. Тот же набор агентов — просто запусти вторую задачу: она встанет в очередь за первой. Один репо — два набора = git worktree (judge оценивает `git diff` в своём cwd).
+
+## Шаблоны (новый проект)
+
+В новом (ещё пустом) проекте вместо своего spec можно применить готовый шаблон пакета:
+
+```
+pi-commander реализуй шаблон basic
+```
+
+Conductor вызовет `pipeline_template name=basic` и скопирует все файлы из каталога `templates/basic/` пакета в корень проекта. Шаблон применяется **только если в проекте ещё нет `task.md`** (проект считается не инициализированным); повторное применение отклоняется.
+
+- Без имени (`pipeline_template` без аргументов) возвращается список доступных шаблонов.
+- **Новый шаблон = новая директория** `templates/<name>/` в пакете — код не меняется, он сразу появляется в списке.
+
+### Шаблон `basic`
+
+- `task.md` — универсальный spec автономного цикла: цель + критерии приёмки + референсы + правила + границы; внутри — git-протокол (каждый подагент в своей ветке `agent/<role>/<iteration>`, только worker принимает решение о merge/push).
+- `worker_roles.md` — каталог ролей подагентов (backend, frontend, tester, reviewer, devops, docs) с назначением, обязанностями, критериями готовности и секцией «Активные роли текущей итерации».
+- `worker_prompt_addition.md` — обязательное правило: перед каждой итерацией worker читает `worker_roles.md` и запускает по одному подагенту на каждую активную роль (не выполняет работу единолично, а управляет подагентами).
 
 ## Инструменты
 
 | Tool | Зачем |
 |---|---|
-| `pipeline_run` | запуск: spec (+ явный набор агентов) → цикл worker→planner→judge |
-| `pipeline_status` | активные задачи: стадия, раунд, история вердиктов, артефакты |
+| `pipeline_run` | запуск: spec (+ явный набор агентов, + `slices=N` для fan-out) → цикл; занятые агенты = очередь |
+| `pipeline_template` | шаблоны нового проекта: список (без name) или копирование файлов шаблона `templates/<name>/` в корень проекта (только пока нет `task.md`) |
+| `pipeline_status` | задачи: активные (стадия, раунд, вердикты, артефакты) + очередь + последние завершённые |
 | `pipeline_register` | агент (tmux-панель или RPC) + роль в реестр + bootstrap |
 | `pipeline_agents` | реестр + живость + занятость в задачах |
 | `pipeline_send` | сообщение агенту (ad-hoc/отладка) |
@@ -112,24 +140,28 @@ tmux list-panes -s -F "#{pane_id}  #{pane_current_path}  #{pane_current_command}
 
 ## Loop и guardrails
 
-`round: worker → planner → judge → pass | revise (round N+1) | blocked (к тебе)`.
-Эскалация: `max_rounds` (default 3), **cycle-detect** (findings двух раундов >50% совпадают), Q&A-loop (>3 вопросов за этап), мёртвый агент, невалидный verdict судьи после повторного запроса. Мягкие пороги (45 мин этап / 15 мин Q&A / 10 мин verdict) работу НЕ откатывают: conductor уведомляет и ждёт, пока агент жив.
+`round: worker → (planner ∥ judge) → pass | revise (round N+1) | blocked (к тебе)`. В sliced-раунде 1 перед worker'ами — decompose (planner → slices.json → N worktrees).
+Эскалация: `max_rounds` (default 3), **cycle-detect** (findings двух раундов >50% совпадают), Q&A-loop (>3 вопросов за этап), мёртвый агент, невалидный verdict судьи после повторного запроса, merge-конфликт слайсов (sliced). Мягкие пороги (45 мин этап / 15 мин Q&A) работу НЕ откатывают: conductor уведомляет и ждёт, пока агент жив.
 
 ## Рестарты conductor'а
 - **RPC-агенты**: lazy auto-respawn — при первом обращении мёртвый агент из реестра поднимается заново: `--session-dir` изолирован на агента, `--continue` — агент помнит прошлые задачи. Без перерегистрации.
-- **Задачи, застрявшие в активной стадии** при рестарте: автоматически `escalated: conductor перезапустился` (state.json жив — перезапусти или доделай руками).
+- **Задачи в очереди** переживают рестарт: планировщик запустит их, когда агенты будут готовы.
+- **Задачи, застрявшие в активной стадии** при рестарте: автоматически `escalated: conductor перезапустился` (state.json жив — перезапусти или доделай руками; sliced-worktrees остаются на диске — `git worktree list` / `remove`).
 - **tmux/tmux-auto панели**: живы, пока жив tmux-сервер; registry хранит pane id.
 
 ## Layout
 
-`.pi/pipeline/` — `registry.json`, `PROTOCOL.md`, `<T-id>/{spec.md, state.json, round-N/{brief-*, *report/decision/verdict, ask-worker-*, answers-*, done-*}}`.
+`.pi/pipeline/` — `registry.json`, `PROTOCOL.md`, `<T-id>/{spec.md, state.json, round-N/{brief-*, *report/decision/verdict, ask-worker-*, answers-*, done-*}}`, в sliced-режиме ещё `<T-id>/worktrees/<slice>` (чистятся по pass) и `round-1/slice-<k>/…`.
 
-## Selfcheck
+## Тесты
 
-`node -e "import('jiti').then(...)" test/selfcheck.ts` — см. `package.json` → `npm test` (cycle-detect, verdict-парсинг, brief'ы, миграция реестра, параллельные задачи).
+- `npm test` — selfcheck: cycle-detect, verdict-парсинг, parseSlices, brief'ы (обычные/decompose/slice), очередь и claiming, миграция реестра + загрузка расширения.
+- `npm run test:e2e` — полный цикл `runTask` с фейковыми агентами: Q&A в раунде 1, revise → pass в раунде 2, abort.
+- `npm run test:e2e:slices` — sliced-цикл в реальном git-репо: decompose → 2 воркера в worktrees → merge → pass → cleanup.
 
 ## Ограничения (v1)
 
-- Одна роль в задаче — один агент; параллельность — через разные наборы.
+- Одна роль в задаче — один агент; параллельность — через очередь, разные наборы и slices.
+- Slices: round 1 — fan-out в worktrees (только rpc-воркеры); раунды 2+ — обычный один worker. Слайсы дробит planner — качество fan-out = качество `slices.json` (конфликтующие scope = merge-эскалация).
 - Q&A только worker→planner (mid-round); у planner/judge вопросы — end-of-round через артефакты.
 - RPC-агент при respawn продолжает свою последнюю сессию (--continue в его session-dir). Если «память» вредна — перерегистрируй с новым именем (чистый session-dir).

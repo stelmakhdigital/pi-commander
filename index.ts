@@ -3,7 +3,6 @@
  * в цепочку worker → planner → judge с loop'ом по вердикту судьи.
  * Conductor детерминирован (без LLM); LLM — только внутри агентов.
  */
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -11,20 +10,26 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { loadRegistry, saveRegistry } from "./registry.ts";
 import { RpcAgent } from "./rpc.ts";
+import { head, isClean, isRepo } from "./git.ts";
 import {
 	PIPELINE_DIR,
 	ROLES,
 	findActiveTasks,
+	findClaimingTasks,
+	findQueuedTasks,
 	readState,
 	runTask,
 	saveState,
 	taskHistory,
 	type Agent,
+	type LoopDeps,
 	type Role,
+	type Slice,
 	type TaskState,
 } from "./state.ts";
 import { isAlive as tmuxAlive, createWindow, createPane, sendLine } from "./tmux.ts";
 import { PROTOCOL } from "./protocol.ts";
+import { applyTemplate, listTemplates } from "./templates.ts";
 
 export default function commander(pi: ExtensionAPI) {
 	const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: undefined });
@@ -45,6 +50,7 @@ export default function commander(pi: ExtensionAPI) {
 	 * (память в его собственном session-dir), если процесс уже был в этой сессии. */
 	const ensureRpc = (a: Agent, cwd: string): void => {
 		if (a.surface.kind !== "rpc") return;
+		if (a.name.includes("/")) return; // временные slice-агенты не респаунятся
 		if (rpcAgents.get(a.name)?.alive) return;
 		const sessionDir = path.join(PIPELINE_DIR(cwd), "rpc", a.name, "sessions");
 		fs.mkdirSync(sessionDir, { recursive: true });
@@ -102,24 +108,97 @@ export default function commander(pi: ExtensionAPI) {
 		return { agents, problems };
 	};
 
-	/** Конфликт-чек: агент уже занят в другой активной задаче (параллельные задачи). */
+	/** Конфликт-чек: агент уже занят в другой задаче (активной или в очереди). */
 	const busyAgents = (cwd: string, exceptId?: string): Map<string, string> => {
 		const busy = new Map<string, string>();
-		for (const t of findActiveTasks(cwd)) {
+		for (const t of findClaimingTasks(cwd)) {
 			if (t.id === exceptId) continue;
 			for (const [r, name] of Object.entries(t.agents ?? {})) if (name) busy.set(name, `${t.id} (${r})`);
 		}
 		return busy;
 	};
 
+	/** Запуск runTask с зависимостями (единый путь: прямой запуск и очередь). */
+	const launched = new Set<string>();
+	const launch = (task: TaskState, agents: Agent[], cwd: string) => {
+		launched.add(task.id);
+		const deps: LoopDeps = {
+			agents,
+			sendTo: (a, l) => sendTo(a, l, cwd),
+			alive,
+			notify,
+			spawnSliceWorker: async (_t, s: Slice, wt: string) => {
+				const name = `${task.id}/${s.name}`;
+				const worker = agents.find((a) => a.role === "worker");
+				const model = worker && worker.surface.kind === "rpc" ? worker.surface.model : undefined;
+				const sessionDir = path.join(task.dir, "sessions", s.name);
+				fs.mkdirSync(sessionDir, { recursive: true });
+				rpcAgents.set(name, new RpcAgent({ cwd: wt, model, sessionDir }));
+				return { name, role: "worker" as const, surface: { kind: "rpc" as const, model } };
+			},
+			killAgent: (a) => {
+				if (!a.name.startsWith(`${task.id}/`)) return;
+				rpcAgents.get(a.name)?.kill();
+				rpcAgents.delete(a.name);
+			},
+		};
+		runTask(task, deps).catch((err) => notify(`[commander] ${task.id}: ОШИБКА: ${(err as Error)?.message ?? err}`));
+	};
+
+	/** Очередь: queued-задача стартует, когда её набор агентов свободен (FIFO). */
+	const tickQueue = () => {
+		try {
+			const cwd = process.cwd();
+			for (const t of findQueuedTasks(cwd)) {
+				if (launched.has(t.id)) continue;
+				const reg = loadRegistry(cwd);
+				const agents: Agent[] = [];
+				const problems: string[] = [];
+				for (const r of ROLES) {
+					const name = t.agents?.[r];
+					const a = name ? reg.agents.find((x) => x.name === name) : reg.agents.find((x) => x.role === r);
+					if (!a) { problems.push(`нет агента «${name ?? r}» (роль ${r}) в реестре`); continue; }
+					if (a.surface.kind === "rpc") ensureRpc(a, cwd);
+					if (!alive(a)) { problems.push(`агент ${a.name} (${r}): не жив`); continue; }
+					agents.push(a);
+				}
+				if (problems.length) {
+					t.stage = "escalated";
+					t.notes = `очередь: ${problems.join("; ")}`;
+					saveState(t);
+					notify(`[commander] ${t.id}: ESCALATION — ${t.notes}`);
+					continue;
+				}
+				if (t.mode === "sliced") {
+					const w = agents.find((a) => a.role === "worker");
+					if (!w || w.surface.kind !== "rpc") {
+						t.stage = "escalated";
+						t.notes = "очередь: sliced-задача требует rpc-воркера";
+						saveState(t);
+						notify(`[commander] ${t.id}: ESCALATION — ${t.notes}`);
+						continue;
+					}
+				}
+				const busy = busyAgents(cwd, t.id);
+				if (agents.some((a) => busy.has(a.name))) continue; // ещё заняты — ждём
+				launch(t, agents, cwd);
+			}
+		} catch (e) {
+			notify(`[commander] очередь: ошибка: ${(e as Error).message ?? e}`);
+		}
+	};
+	const queueTimer = setInterval(tickQueue, 3000);
+	queueTimer.unref();
+
 	pi.registerTool({
 		name: "pipeline_run",
 		label: "pipeline_run",
 		description:
-			"Запустить pipeline-цепочку worker→planner→judge. spec — путь к spec.md или текст задачи (обязателен раздел «Критерии приёмки»). agents — явный набор имён (для параллельных задач); по умолчанию первые зарегистрированные по ролям. Агенты не должны быть заняты в другой активной задаче. Loop идёт фоном, результат придёт сообщением.",
+			"Запустить pipeline-цепочку worker→planner→judge. spec — путь к spec.md или текст задачи (обязателен раздел «Критерии приёмки»). agents — явный набор имён (для параллельных задач); по умолчанию первые зарегистрированные по ролям. Если агенты заняты — задача в очередь, стартует автоматически. slices — fan-out: planner дробит spec на 2..6 слайсов, воркеры параллельно в git worktrees (нужен git + чистое дерево + rpc-воркер). Loop идёт фоном, результат придёт сообщением.",
 		parameters: Type.Object({
 			spec: Type.String({ description: "Путь к spec.md или текст задачи" }),
 			max_rounds: Type.Optional(Type.Number({ description: "Максимум раундов (default 3)" })),
+			slices: Type.Optional(Type.Number({ description: "fan-out: 2..6 слайсов, параллельные воркеры в git worktrees" })),
 			agents: Type.Optional(
 				Type.Object({
 					worker: Type.Optional(Type.String({ description: "имя worker-агента" })),
@@ -132,15 +211,30 @@ export default function commander(pi: ExtensionAPI) {
 			const cwd = ctx.cwd || process.cwd();
 			const { agents, problems } = resolveAgents(cwd, p.agents);
 			if (problems.length) return text("Pipeline не запущен:\n- " + problems.join("\n- "));
-			const busy = busyAgents(cwd);
-			const conflicts = agents.filter((a) => busy.has(a.name)).map((a) => `${a.name} занят: ${busy.get(a.name)}`);
-			if (conflicts.length) return text("Не запущен — агенты заняты в другой активной задаче:\n- " + conflicts.join("\n- ") + "\nДождись завершения или задай другой набор (agents={...}).");
 
 			let specText: string;
 			if (fs.existsSync(p.spec) && fs.statSync(p.spec).isFile()) specText = fs.readFileSync(p.spec, "utf8");
 			else specText = p.spec;
 			if (!/критерии приёмки/i.test(specText))
 				return text("В spec нет раздела «Критерии приёмки» — судье нечем сверять. Шаблон: PROTOCOL.md §spec. Добавь и запусти заново.");
+
+			// Sliced-режим (fan-out): planner дробит spec, воркеры параллельно в worktrees.
+			let mode: "serial" | "sliced" = "serial";
+			let sliceCount: number | undefined;
+			if (p.slices !== undefined) {
+				if (!Number.isInteger(p.slices) || p.slices < 2 || p.slices > 6) return text("slices: нужно целое 2..6.");
+				if (!isRepo(cwd) || !isClean(cwd)) return text("slices: нужен git-репо с чистым деревом (закоммить/убери незакоммиченное).");
+				const w = agents.find((a) => a.role === "worker");
+				if (!w || w.surface.kind !== "rpc")
+					return text(`slices: worker должен быть rpc (у «${w?.name ?? "?"}» — ${w?.surface.kind ?? "?"}); slice-воркеры conductor поднимает сам в git worktrees.`);
+				mode = "sliced";
+				sliceCount = p.slices;
+			}
+
+			let base_head: string | null = null;
+			try {
+				base_head = head(cwd);
+			} catch {}
 
 			const root = PIPELINE_DIR(cwd);
 			ensureProtocol(cwd);
@@ -150,33 +244,65 @@ export default function commander(pi: ExtensionAPI) {
 			fs.mkdirSync(path.join(dir, "round-1"), { recursive: true });
 			fs.writeFileSync(path.join(dir, "spec.md"), specText.trimEnd() + "\n");
 
-			let base_head: string | null = null;
-			try {
-				base_head = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
-			} catch {}
-
 			const task: TaskState = {
 				id,
 				dir,
 				base_head,
+				cwd,
 				round: 1,
 				stage: "worker",
 				max_rounds: p.max_rounds ?? 3,
 				history: [],
 				agents: Object.fromEntries(ROLES.map((r) => [r, agents.find((a) => a.role === r)!.name])),
+				mode,
+				slice_count: sliceCount,
 				started_at: new Date().toISOString(),
 			};
 			fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify(task, null, 2));
 
-			runTask(task, { agents, sendTo: (a, line) => sendTo(a, line, cwd), alive, notify }).catch((err) => notify(`[commander] ${id}: ОШИБКА: ${(err as Error)?.message ?? err}`));
-
 			const who = agents.map((a) => `${a.role}=${a.name}(${surfaceStr(a)})`).join(", ");
-			return text(`${id} запущен: round 1 → worker. Агенты: ${who}. Прогресс: pipeline_status. Результат придёт сообщением.`);
+			const busy = busyAgents(cwd, id);
+			const conflicts = agents.filter((a) => busy.has(a.name)).map((a) => `${a.name} занят: ${busy.get(a.name)}`);
+			if (conflicts.length) {
+				task.stage = "queued";
+				saveState(task);
+				return text(`${id} поставлен в очередь (агенты заняты: ${conflicts.join(", ")}). Стартует автоматически, когда освободятся. Прогресс: pipeline_status.`);
+			}
+			launch(task, agents, cwd);
+			return text(`${id} запущен: round 1 → ${mode === "sliced" ? `decompose → ${sliceCount} slice-воркера (worktrees)` : "worker"}. Агенты: ${who}. Прогресс: pipeline_status. Результат придёт сообщением.`);
 		},
 		renderCall(args, theme) {
 			const sel = args.agents as Record<string, string> | undefined;
 			const sub = sel ? ` [${ROLES.filter((r) => sel[r]).map((r) => sel[r]).join(", ")}]` : "";
 			return new Text(theme.fg("toolTitle", theme.bold("pipeline_run ")) + theme.fg("muted", `${args.spec}${sub}`));
+		},
+	});
+
+	pi.registerTool({
+		name: "pipeline_template",
+		label: "pipeline_template",
+		description:
+			"Шаблоны инициализации нового проекта. Без name — список доступных шаблонов. name (например basic) — скопировать все файлы шаблона (каталог templates/<name>/ пакета) в корень текущего проекта; возможно только если в проекте ещё нет task.md (проект ещё не инициализирован). Новые шаблоны — новые директории в templates/, код не меняется.",
+		parameters: Type.Object({
+			name: Type.Optional(Type.String({ description: "Имя шаблона — директория в templates/ пакета (например basic). Без name — список шаблонов." })),
+		}),
+		async execute(_id, p, _signal, _u, ctx) {
+			const cwd = ctx.cwd || process.cwd();
+			if (!p.name) {
+				const list = listTemplates();
+				return list.length
+					? text(`Доступные шаблоны: ${list.join(", ")}. Применить в этом проекте: pipeline_template name=<имя>.`)
+					: text("Шаблоны не найдены (каталог templates/ пакета пуст).");
+			}
+			try {
+				const { copied } = applyTemplate(p.name, cwd);
+				return text(`Шаблон «${p.name}» применён в ${cwd}: ${copied.join(", ")}. Дальше: при необходимости подправь task.md под проект, зарегистрируй агентов (pipeline_register) и запусти pipeline по task.md.`);
+			} catch (e) {
+				return text(`Шаблон «${p.name}» не применён: ${(e as Error).message}`);
+			}
+		},
+		renderCall(args, theme) {
+			return new Text(theme.fg("toolTitle", theme.bold("pipeline_template ")) + theme.fg("muted", args.name ?? "список"));
 		},
 	});
 
@@ -206,9 +332,11 @@ export default function commander(pi: ExtensionAPI) {
 				return text(t ? render(t) : `Задача ${p.id} не найдена.`);
 			}
 			const active = findActiveTasks(cwd);
-			const done = taskHistory(cwd).filter((t) => !active.some((a) => a.id === t.id)).slice(-3);
-			if (!active.length && !done.length) return text("Задач нет.");
-			const out = active.length ? `Активные:\n\n${active.map(render).join("\n\n")}` : "Активных нет.";
+			const queued = findQueuedTasks(cwd);
+			const done = taskHistory(cwd).filter((t) => !active.some((a) => a.id === t.id) && t.stage !== "queued").slice(-3);
+			if (!active.length && !queued.length && !done.length) return text("Задач нет.");
+			let out = active.length ? `Активные:\n\n${active.map(render).join("\n\n")}` : "Активных нет.";
+			if (queued.length) out += `\n\nВ очереди: ${queued.map((t) => `${t.id} [${Object.values(t.agents ?? {}).join(", ")}]${t.mode === "sliced" ? ` slices=${t.slice_count}` : ""}`).join(", ")}`;
 			return text(out + (done.length ? `\n\nПоследние: ${done.map((t) => `${t.id} [${t.stage}] ${t.notes ?? ""}`).join("; ")}` : ""));
 		},
 		renderCall(args, theme) {
@@ -225,7 +353,7 @@ export default function commander(pi: ExtensionAPI) {
 			name: Type.String({ description: "Имя агента" }),
 			role: Type.String({ description: "Роль: worker | planner | judge" }),
 			kind: Type.Optional(Type.Union([Type.Literal("tmux"), Type.Literal("tmux-auto"), Type.Literal("tmux-split"), Type.Literal("rpc")], { description: "default: tmux; tmux-auto = отдельное окно, tmux-split = плитка в окне conductor'а" })),
-			pane: Type.Optional(Type.String({ description: "tmux-панель, например %12 (kind=tmux)" })),
+			pane: Type.Optional(Type.String({ description: "tmux-панель, например %12" })),
 			model: Type.Optional(Type.String({ description: "модель (kind=rpc)" })),
 			cwd: Type.Optional(Type.String({ description: "рабочий каталог (kind=rpc; default: каталог проекта)" })),
 		}),
@@ -330,7 +458,7 @@ export default function commander(pi: ExtensionAPI) {
 		}),
 		async execute(_id, p, _signal, _u, ctx) {
 			const cwd = ctx.cwd || process.cwd();
-			const targets = p.id ? [readState(cwd, p.id)].filter((t): t is TaskState => !!t) : findActiveTasks(cwd);
+			const targets = p.id ? [readState(cwd, p.id)].filter((t): t is TaskState => !!t) : findClaimingTasks(cwd);
 			if (!targets.length) return text(p.id ? `Задача ${p.id} не найдена или не активна.` : "Активных задач нет.");
 			for (const t of targets) {
 				fs.writeFileSync(path.join(t.dir, ".abort"), ""); // крутящийся runTask видит по файлу
