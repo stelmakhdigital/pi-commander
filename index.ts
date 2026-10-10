@@ -28,6 +28,7 @@ import {
 	type TaskState,
 } from "./state.ts";
 import { isAlive as tmuxAlive, createWindow, createPane, sendLine } from "./tmux.ts";
+import { Watchdog, WD } from "./watchdog.ts";
 import { PROTOCOL } from "./protocol.ts";
 import { applyTemplate, listTemplates } from "./templates.ts";
 
@@ -190,6 +191,43 @@ export default function commander(pi: ExtensionAPI) {
 	const queueTimer = setInterval(tickQueue, 3000);
 	queueTimer.unref();
 
+	/** Watchdog: зацикливание/простой агентов в активных этапах → nudge → авто-эскалация. */
+	const regAgent = (cwd: string, name?: string): Agent | undefined =>
+		name ? loadRegistry(cwd).agents.find((x) => x.name === name) : undefined;
+	const wdActors = (cwd: string, t: TaskState): Agent[] => {
+		if (t.stage === "worker" && t.mode === "sliced" && t.round === 1) {
+			const prefix = `${t.id}/`;
+			return [...rpcAgents.entries()]
+				.filter(([n, r]) => n.startsWith(prefix) && r.alive)
+				.map(([n]) => ({ name: n, role: "worker" as const, surface: { kind: "rpc" as const } }));
+		}
+		if (t.stage === "judge") return [regAgent(cwd, t.agents?.planner), regAgent(cwd, t.agents?.judge)].filter((a): a is Agent => !!a); // planner ∥ judge
+		if (t.stage === "worker") return [regAgent(cwd, t.agents?.worker)].filter((a): a is Agent => !!a);
+		return [regAgent(cwd, t.agents?.planner)].filter((a): a is Agent => !!a); // decompose
+	};
+	const wd = new Watchdog();
+	const wdTimer = setInterval(() => {
+		const cwd = process.cwd();
+		wd.tick(cwd, {
+			alive,
+			notify,
+			sendTo: (a, l) => sendTo(a, l, cwd),
+			settled: (a) => {
+				if (a.surface.kind !== "rpc") return false;
+				const r = rpcAgents.get(a.name);
+				return !!r?.lastSettledAt && Date.now() - Date.parse(r.lastSettledAt) > WD.settledMs;
+			},
+			sessionDir: (t, a) => {
+				if (a.surface.kind !== "rpc") return null;
+				if (a.name.includes("/")) return path.join(t.dir, "sessions", a.name.split("/").pop()!); // slice-агент
+				return path.join(PIPELINE_DIR(cwd), "rpc", a.name, "sessions");
+			},
+			actors: (t) => wdActors(cwd, t),
+			plannerOf: (t) => regAgent(cwd, t.agents?.planner) ?? null,
+		});
+	}, WD.tickMs);
+	wdTimer.unref();
+
 	pi.registerTool({
 		name: "pipeline_run",
 		label: "pipeline_run",
@@ -257,6 +295,7 @@ export default function commander(pi: ExtensionAPI) {
 				mode,
 				slice_count: sliceCount,
 				started_at: new Date().toISOString(),
+				stage_started_at: new Date().toISOString(),
 			};
 			fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify(task, null, 2));
 
@@ -406,7 +445,7 @@ export default function commander(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "pipeline_agents",
 		label: "pipeline_agents",
-		description: "Список зарегистрированных pipeline-агентов: роль, транспорт, живость; активные задачи и занятость.",
+		description: "Список зарегистрированных pipeline-агентов: роль, транспорт, живость; активные задачи и занятость. Мёртвые агенты остаются в реестре — удалять: pipeline_remove name=... или dead=true.",
 		parameters: Type.Object({}),
 		async execute(_id, _p, _signal, _u, ctx) {
 			const cwd = ctx.cwd || process.cwd();
@@ -424,6 +463,58 @@ export default function commander(pi: ExtensionAPI) {
 		},
 		renderCall(_args, theme) {
 			return new Text(theme.fg("toolTitle", theme.bold("pipeline_agents ")));
+		},
+	});
+
+	pi.registerTool({
+		name: "pipeline_remove",
+		label: "pipeline_remove",
+		description:
+			"Удалить pipeline-агента из реестра (мёртвые tmux-панели/rpc-процессы остаются в реестре навсегда, если не удалять). name — конкретный агент; dead=true — всех мёртвых сразу; force — удалить даже занятого (его задачи будут остановлены). Для rpc-агента процесс убивается.",
+		parameters: Type.Object({
+			name: Type.Optional(Type.String({ description: "Имя агента из реестра" })),
+			dead: Type.Optional(Type.Boolean({ description: "Удалить всех мёртвых (name игнорируется)" })),
+			force: Type.Optional(Type.Boolean({ description: "Удалить даже если агент занят в активной/очередной задаче (задача остановится)" })),
+		}),
+		async execute(_id, p, _signal, _u, ctx) {
+			const cwd = ctx.cwd || process.cwd();
+			const reg = loadRegistry(cwd);
+			if (!reg.agents.length) return text("Реестр пуст — удалять некого.");
+			const targets = p.name ? reg.agents.filter((a) => a.name === p.name) : p.dead ? reg.agents.filter((a) => !alive(a)) : [];
+			if (p.name && !targets.length) return text(`Агент «${p.name}» не найден в реестре (pipeline_agents).`);
+			if (!p.name && !targets.length) return text(p.dead ? "Мёртвых агентов нет — реестр чистый." : "Укажи name или dead=true.");
+			const busy = busyAgents(cwd);
+			const out: string[] = [];
+			for (const a of targets) {
+				const b = busy.get(a.name);
+				if (b && !p.force) {
+					out.push(`пропущен ${a.name} (занят: ${b}); чтобы удалить — force=true (задача остановится)`);
+					continue;
+				}
+				if (b) {
+					for (const t of findClaimingTasks(cwd)) {
+						if (Object.values(t.agents ?? {}).includes(a.name)) {
+							fs.writeFileSync(path.join(t.dir, ".abort"), "");
+							t.stage = "aborted";
+							t.notes = `агент ${a.name} удалён из реестра (force)`;
+							saveState(t);
+							out.push(`задача ${t.id} остановлена (агент ${a.name} занят в ней)`);
+						}
+					}
+				}
+				if (a.surface.kind === "rpc") {
+					rpcAgents.get(a.name)?.kill();
+					rpcAgents.delete(a.name);
+				}
+				reg.agents = reg.agents.filter((x) => x.name !== a.name);
+				out.push(`удалён: ${a.name} (${a.role}, ${surfaceStr(a)})`);
+			}
+			saveRegistry(cwd, reg);
+			return text(out.join("\n"));
+		},
+		renderCall(args, theme) {
+			const what = args.name ?? (args.dead ? "все мёртвые" : "?");
+			return new Text(theme.fg("toolTitle", theme.bold("pipeline_remove ")) + theme.fg("muted", what + (args.force ? " force" : "")));
 		},
 	});
 

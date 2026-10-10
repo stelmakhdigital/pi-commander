@@ -67,6 +67,8 @@ export interface TaskState {
 	slice_count?: number;
 	notes?: string;
 	started_at: string;
+	/** Когда начался текущий stage (watchdog: жёсткий таймаут этапа). */
+	stage_started_at?: string;
 }
 
 export const PIPELINE_DIR = (cwd: string) => path.join(cwd, ".pi", "pipeline");
@@ -74,6 +76,22 @@ export const PIPELINE_DIR = (cwd: string) => path.join(cwd, ".pi", "pipeline");
 const STATE_FILE = "state.json";
 /** Файл-маркер abort: pipeline_abort пишет его, крутящийся runTask видит (in-memory stage не обновляется). */
 const ABORT_FILE = ".abort";
+/** Файл-маркер эскалации watchdog'ом: причина в контенте, крутящийся runTask видит по нему. */
+const ESCALATE_FILE = ".escalate";
+
+export function requestEscalation(task: TaskState, reason: string): void {
+	fs.mkdirSync(task.dir, { recursive: true });
+	fs.writeFileSync(path.join(task.dir, ESCALATE_FILE), reason);
+}
+
+export function readEscalation(task: TaskState): string | null {
+	try {
+		const r = fs.readFileSync(path.join(task.dir, ESCALATE_FILE), "utf8").trim();
+		return r || null;
+	} catch {
+		return null;
+	}
+}
 const POLL_MS = 1500;
 /** Мягкий порог: по нему работу НЕ откатываем — уведомляем и ждём, пока агент жив.
  *  Эскалация только по смерти агента (проверка живости каждые ~10 поллов). */
@@ -284,25 +302,27 @@ export function parseVerdict(file: string): { verdict: string; issues: Issue[]; 
 
 export interface StageResult {
 	ok: boolean;
-	reason: "ok" | "dead" | "aborted" | "qa-loop" | "no-planner" | "qa-dead";
+	reason: "ok" | "dead" | "aborted" | "escalated" | "qa-loop" | "no-planner" | "qa-dead";
 }
 
 interface WaitDeps {
 	label: string;
 	softMs: number;
 	isAborted: () => boolean;
+	isEscalated: () => boolean;
 	isAlive: () => boolean;
 	notify: (t: string) => void;
 }
 
 /** Ожидание артефакта. По softMs работу не откатываем: агент жив — ждём до готовности
- *  (одно уведомление о превышении); агент умер — "dead". */
-async function waitWhileAlive(ok: () => boolean, w: WaitDeps): Promise<"ok" | "aborted" | "dead"> {
+ *  (одно уведомление о превышении); агент умер — "dead"; watchdog эскалировал — "escalated". */
+async function waitWhileAlive(ok: () => boolean, w: WaitDeps): Promise<"ok" | "aborted" | "dead" | "escalated"> {
 	const t0 = Date.now();
 	let warned = false;
 	let i = 0;
 	while (true) {
 		if (w.isAborted()) return "aborted";
+		if (w.isEscalated()) return "escalated";
 		if (ok()) return "ok";
 		if (i++ % 10 === 0 && !w.isAlive()) return "dead";
 		if (!warned && Date.now() - t0 >= w.softMs) {
@@ -345,6 +365,7 @@ export async function waitForStage(task: TaskState, rd: string, deps: LoopDeps, 
 	const t0 = Date.now();
 	while (true) {
 		if (aborted()) return { ok: false, reason: "aborted" };
+		if (readEscalation(task)) return { ok: false, reason: "escalated" };
 		if (fs.existsSync(marker)) return { ok: true, reason: "ok" };
 		if (fs.existsSync(askBase)) {
 			qa++;
@@ -364,6 +385,7 @@ export async function waitForStage(task: TaskState, rd: string, deps: LoopDeps, 
 				label: `${task.id} Q&A-${k} (planner ${planner.name})`,
 				softMs: QA_TIMEOUT_MS,
 				isAborted: aborted,
+				isEscalated: () => readEscalation(task) !== null,
 				isAlive: () => deps.alive(planner),
 				notify: deps.notify,
 			});
@@ -385,11 +407,25 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 	const agentFor = (role: Role) => agents.find((a) => a.role === role);
 	const aborted = () => fs.existsSync(path.join(task.dir, ABORT_FILE));
 	const rdOf = (n: number) => path.join(task.dir, `round-${n}`);
+	const setStage = (s: TaskState["stage"]) => {
+		task.stage = s;
+		task.stage_started_at = new Date().toISOString();
+		saveState(task);
+	};
 	const escalate = (reason: string) => {
 		task.stage = "escalated";
 		task.notes = reason;
 		saveState(task);
 		notify(`[commander] ${task.id}: ESCALATION — ${reason}. Состояние: ${path.join(task.dir, "state.json")}`);
+	};
+	/** Watchdog уже уведомил — runTask молча останавливается (двойной notify не нужен). */
+	const checkEsc = (): boolean => {
+		const r = readEscalation(task);
+		if (!r) return false;
+		task.stage = "escalated";
+		task.notes = `watchdog: ${r}`;
+		saveState(task);
+		return true;
 	};
 	/** Временные slice-агенты (убиваются в finally) и worktrees+ветки (чистятся по pass). */
 	const sliceAgents: Agent[] = [];
@@ -410,7 +446,7 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 		const rd = rdOf(task.round);
 		sendStage(agent, rd, "brief-planner.md", buildBrief(task, "planner"));
 		const r = await waitWhileAlive(() => fs.existsSync(path.join(rd, "done-planner")), {
-			label: `${task.id} planner ${agent.name}`, softMs: STAGE_TIMEOUT_MS, isAborted: aborted, isAlive: () => alive(agent), notify,
+			label: `${task.id} planner ${agent.name}`, softMs: STAGE_TIMEOUT_MS, isAborted: aborted, isEscalated: () => readEscalation(task) !== null, isAlive: () => alive(agent), notify,
 		});
 		return { ok: r === "ok", reason: r };
 	};
@@ -422,7 +458,7 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 		if (!alive(agent)) return { fail: `агент ${agent.name} (judge): мёртв` };
 		const rd = rdOf(task.round);
 		sendStage(agent, rd, "brief-judge.md", buildBrief(task, "judge"));
-		const wv = { label: `${task.id} judge ${agent.name}`, softMs: STAGE_TIMEOUT_MS, isAborted: aborted, isAlive: () => alive(agent), notify };
+		const wv = { label: `${task.id} judge ${agent.name}`, softMs: STAGE_TIMEOUT_MS, isAborted: aborted, isEscalated: () => readEscalation(task) !== null, isAlive: () => alive(agent), notify };
 		const r = await waitWhileAlive(() => fs.existsSync(path.join(rd, "done-judge")), wv);
 		if (r !== "ok") return { fail: r === "aborted" ? "aborted" : `агент ${agent.name} (judge): мёртв` };
 		const vf = path.join(rd, "judge-verdict.json");
@@ -438,13 +474,13 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 
 	try {
 		while (!aborted()) {
+			if (checkEsc()) return;
 			const sliced1 = task.mode === "sliced" && task.round === 1;
 
 			if (sliced1) {
 				const rd = rdOf(task.round);
 				// 1) decompose: planner дробит spec на слайсы
-				task.stage = "planner";
-				saveState(task);
+				setStage("planner");
 				const planner = agentFor("planner");
 				if (!planner) return escalate("нет агента с ролью planner в наборе задачи");
 				if (!alive(planner)) return escalate(`агент ${planner.name} (planner): мёртв`);
@@ -454,14 +490,14 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 				const sf = path.join(rd, "slices.json");
 				const maxS = task.slice_count ?? 6;
 				const dr = await waitWhileAlive(() => parseSlices(sf, maxS) !== null, {
-					label: `${task.id} decompose ${planner.name}`, softMs: STAGE_TIMEOUT_MS, isAborted: aborted, isAlive: () => alive(planner), notify,
+					label: `${task.id} decompose ${planner.name}`, softMs: STAGE_TIMEOUT_MS, isAborted: aborted, isEscalated: () => readEscalation(task) !== null, isAlive: () => alive(planner), notify,
 				});
 				if (dr === "aborted") return;
+				if (dr === "escalated") { checkEsc(); return; }
 				if (dr !== "ok") return escalate(`planner не выдал валидный slices.json (${dr === "dead" ? `агент ${planner.name} умер` : "недопустимый формат: массив из 2..${maxS} объектов {name, scope, brief}"})`);
 				const slices = parseSlices(sf, maxS)!;
 				// 2) slice-воркеры параллельно, каждый в своём worktree
-				task.stage = "worker";
-				saveState(task);
+				setStage("worker");
 				const wr = await Promise.all(
 					slices.map(async (s, k) => {
 						const wt = path.join(task.dir, "worktrees", s.name);
@@ -480,6 +516,7 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 						return { s, ok: w.ok, fail: w.ok ? undefined : w.reason, wt, branch };
 					}),
 				);
+				if (checkEsc()) return;
 				const failed = wr.filter((r) => !r.ok);
 				if (failed.length) return escalate(failed.map((r) => `слайс ${r.s.name}: ${r.fail ?? "worker не завершил этап"}`).join("; "));
 				// 3) commit worktree'ов + merge в основное дерево
@@ -491,8 +528,7 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 				}
 			} else {
 				// 1) worker (обычный)
-				task.stage = "worker";
-				saveState(task);
+				setStage("worker");
 				const worker = agentFor("worker");
 				if (!worker) return escalate("нет агента с ролью worker в наборе задачи");
 				if (!alive(worker)) return escalate(`агент ${worker.name} (worker): мёртв`);
@@ -501,6 +537,7 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 				const w = await waitForStage(task, rd, deps, worker);
 				if (!w.ok) {
 					if (w.reason === "aborted") return;
+					if (w.reason === "escalated") { checkEsc(); return; }
 					const reasons: Record<string, string> = {
 						dead: `агент ${worker.name} (worker): мёртв (панель/процесс пропал)`,
 						"qa-loop": `worker зациклится на вопросах (> ${MAX_QA_PER_STAGE} Q&A за этап)`,
@@ -513,16 +550,17 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 
 			// 2) planner ∥ judge — параллельно (не зависят друг от друга: planner — по отчётам,
 			//    judge — по spec+diff). Решение по раунду — после обоих.
-			task.stage = "judge";
-			saveState(task);
+			setStage("judge");
 			const [pr, jr] = await Promise.all([plannerStage(), judgeStage()]);
 			if (aborted()) return;
+			if (checkEsc()) return;
 			if (!jr.v) return escalate(jr.fail!);
 			const v = jr.v;
 			task.history.push({ round: task.round, verdict: v.verdict, issues: v.issues, notes: v.notes });
 			saveState(task);
 			if (v.verdict === "pass") {
 				task.stage = "done";
+				task.stage_started_at = new Date().toISOString();
 				saveState(task);
 				for (const c of cleanups) {
 					worktreeRemove(task.cwd, c.wt);

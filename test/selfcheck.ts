@@ -3,7 +3,8 @@ import assert from "node:assert";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildBrief, buildDecomposeBrief, buildSliceBrief, isCycle, parseSlices, parseVerdict, readState, findQueuedTasks, findClaimingTasks, normalizeAgent, type Issue, type TaskState } from "../state.ts";
+import { buildBrief, buildDecomposeBrief, buildSliceBrief, isCycle, parseSlices, parseVerdict, readState, findQueuedTasks, findClaimingTasks, normalizeAgent, requestEscalation, readEscalation, type Agent, type Issue, type TaskState } from "../state.ts";
+import { Watchdog, taskSignature, sessionLoopDetect } from "../watchdog.ts";
 import { PROTOCOL } from "../protocol.ts";
 import { applyTemplate, listTemplates, TEMPLATES_DIR } from "../templates.ts";
 
@@ -103,6 +104,95 @@ assert.ok(
 assert.throws(() => applyTemplate("basic", proj), /task\.md/, "templates: повторное применение отклонено (task.md уже есть)");
 assert.throws(() => applyTemplate("../templates", proj), /недопустимое имя/, "templates: выход за пределы templates/ запрещён");
 assert.throws(() => applyTemplate("no-such-template", proj), /не найден/, "templates: неизвестный шаблон");
+
+// watchdog: без прогресса → nudge → авто-эскалация; есть прогресс → тишина
+const wdcwd = fs.mkdtempSync(path.join(os.tmpdir(), "commander-wd-"));
+const wdir = path.join(wdcwd, ".pi", "pipeline", "T-wd");
+fs.mkdirSync(path.join(wdir, "round-1"), { recursive: true });
+const wtask: TaskState = {
+	id: "T-wd", dir: wdir, base_head: null, cwd: wdcwd, round: 1, stage: "worker", max_rounds: 3,
+	history: [], agents: { worker: "w1" }, started_at: "", stage_started_at: new Date().toISOString(),
+};
+fs.writeFileSync(path.join(wdir, "state.json"), JSON.stringify(wtask));
+const wd = new Watchdog({ nuIdleMs: 0, nuIntervalMs: 0, hardIdleMs: 30, stageHardMs: 1e9, recentWindow: 5 });
+const wactor: Agent = { name: "w1", role: "worker", surface: { kind: "rpc" } };
+const sent: string[] = [];
+const noted: string[] = [];
+const whooks = { alive: () => true, sendTo: (_a: Agent, l: string) => sent.push(l), notify: (t: string) => noted.push(t), settled: () => false, sessionDir: () => null, actors: () => [wactor], plannerOf: () => null };
+const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
+wd.tick(wdcwd, whooks); // инициализация наблюдения
+await sleepMs(5);
+wd.tick(wdcwd, whooks); // прогресса нет → nudge №1
+assert.equal(sent.length, 1, "watchdog: nudge №1 отправлен");
+assert.ok(sent[0].includes("watchdog") && sent[0].includes("done-worker") && sent[0].includes("ask-worker.md"), "watchdog: в nudge'е выходы (done/ask)");
+await sleepMs(5);
+wd.tick(wdcwd, whooks); // → nudge №2 (максимум)
+assert.equal(sent.length, 2, "watchdog: nudge №2 отправлен");
+await sleepMs(40); // > hardIdleMs
+wd.tick(wdcwd, whooks); // → авто-эскалация, без новых сообщений
+assert.equal(sent.length, 2, "watchdog: после эскалации nudge'ов нет");
+assert.equal(noted.length, 1, "watchdog: эскалация уведомлена");
+assert.ok(noted[0].includes("WATCHDOG") && noted[0].includes("T-wd"), "watchdog: текст эскалации");
+assert.equal(readState(wdcwd, "T-wd")?.stage, "escalated", "watchdog: stage=escalated на диске");
+assert.ok(readEscalation(wtask), "watchdog: .escalate-файл с причиной");
+wd.tick(wdcwd, whooks); // после эскалации — тишина
+assert.equal(noted.length, 1, "watchdog: дублей эскалации нет");
+
+// watchdog: файл изменился = прогресс, nudge не шлётся
+const wdcwd2 = fs.mkdtempSync(path.join(os.tmpdir(), "commander-wd2-"));
+const wdir2 = path.join(wdcwd2, ".pi", "pipeline", "T-wd2");
+fs.mkdirSync(path.join(wdir2, "round-1"), { recursive: true });
+const wtask2: TaskState = { ...wtask, id: "T-wd2", dir: wdir2, cwd: wdcwd2 };
+fs.writeFileSync(path.join(wdir2, "state.json"), JSON.stringify(wtask2));
+const sent2: string[] = [];
+const whooks2 = { ...whooks, sendTo: (_a: Agent, l: string) => sent2.push(l) };
+wd.tick(wdcwd2, whooks2); // инициализация (другая задача — отдельное состояние)
+fs.writeFileSync(path.join(wdir2, "round-1", "worker-report.md"), "прогресс");
+await sleepMs(5);
+wd.tick(wdcwd2, whooks2); // новая сигнатура = прогресс → не нуджим
+assert.equal(sent2.length, 0, "watchdog: прогресс (новый файл) — nudge не шлётся");
+assert.notEqual(taskSignature({ ...wtask2 }), "", "taskSignature: строка");
+
+// requestEscalation/readEscalation: round-trip
+assert.equal(readEscalation(wtask2), null, "readEscalation: без файла — null");
+requestEscalation(wtask2, "тест-причина");
+assert.equal(readEscalation(wtask2), "тест-причина", "readEscalation: причина из .escalate");
+
+// watchdog: read-loop по логам сессий — «по кругу читает инструкции»
+const sessDir = fs.mkdtempSync(path.join(os.tmpdir(), "commander-sess-"));
+const sessFile = path.join(sessDir, "s.jsonl");
+const toolLine = (name: string, args: Record<string, unknown>) =>
+	JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", name, arguments: args }] } });
+fs.writeFileSync(
+	sessFile,
+	Array.from({ length: 18 }, () => toolLine("read", { path: "/proj/INSTRUCTIONS.md" })).concat(toolLine("read", { path: "/proj/other.md" })).join("\n") + "\n",
+);
+const lp = sessionLoopDetect(sessDir);
+assert.ok(lp.loop && (lp.detail ?? "").includes("INSTRUCTIONS.md"), "loop-detect: read по кругу пойман");
+assert.ok((lp.detail ?? "").includes("без изменений"), "loop-detect: в detail — что изменений не было");
+// с изменяющим вызовом в окне — не loop (агент реально работает)
+fs.appendFileSync(sessFile, toolLine("write", { path: "/proj/a.ts" }) + "\n" + toolLine("read", { path: "/proj/INSTRUCTIONS.md" }) + "\n");
+assert.equal(sessionLoopDetect(sessDir).loop, false, "loop-detect: есть write в окне — не loop");
+// мало вызовов (актёр только начал) — не судим
+const sessDir2 = fs.mkdtempSync(path.join(os.tmpdir(), "commander-sess2-"));
+fs.writeFileSync(path.join(sessDir2, "s.jsonl"), Array.from({ length: 5 }, () => toolLine("read", { path: "x" })).join("\n") + "\n");
+assert.equal(sessionLoopDetect(sessDir2).loop, false, "loop-detect: < 15 вызовов — не судим");
+// полный цикл: read-loop → nudge сразу (не ждём idle-пороги) → эскалация после maxNudges
+const wdcwd3 = fs.mkdtempSync(path.join(os.tmpdir(), "commander-wd3-"));
+const wdir3 = path.join(wdcwd3, ".pi", "pipeline", "T-loop");
+fs.mkdirSync(path.join(wdir3, "round-1"), { recursive: true });
+const wtask3: TaskState = { ...wtask, id: "T-loop", dir: wdir3, cwd: wdcwd3 };
+fs.writeFileSync(path.join(wdir3, "state.json"), JSON.stringify(wtask3));
+const sent3: string[] = [];
+const noted3: string[] = [];
+const whooks3 = { alive: () => true, sendTo: (_a: Agent, l: string) => sent3.push(l), notify: (t: string) => noted3.push(t), settled: () => false, sessionDir: () => sessDir, actors: () => [wactor], plannerOf: () => null };
+// в сессии снова только read-loop (обновим хвост без мутаций)
+fs.writeFileSync(sessFile, Array.from({ length: 20 }, () => toolLine("read", { path: "/proj/INSTRUCTIONS.md" })).join("\n") + "\n");
+wd.tick(wdcwd3, whooks3); // инициализация
+wd.tick(wdcwd3, whooks3); // loop сразу → nudge №1 (idle-пороги 15/45 мин не ждут)
+assert.equal(sent3.length, 1, "loop: nudge сразу");
+assert.ok(sent3[0].includes("зациклился") && sent3[0].includes("INSTRUCTIONS.md"), "loop: текст nudge с деталями");
+assert.equal(noted3.length, 0, "loop: до эскалации notify нет");
 
 // шаблоны: новая директория в templates/ = новый шаблон, код не трогаем
 const tmpT = path.join(TEMPLATES_DIR, "zz-selfcheck-tmp");

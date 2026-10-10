@@ -3,7 +3,7 @@ import assert from "node:assert";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { runTask, type Agent, type TaskState } from "../state.ts";
+import { runTask, requestEscalation, type Agent, type TaskState } from "../state.ts";
 
 const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "commander-e2e-"));
 const dir = path.join(cwd, ".pi", "pipeline", "T-e2e");
@@ -87,4 +87,22 @@ await new Promise((r) => setTimeout(r, 2000)); // worker «работает» (d
 fs.writeFileSync(path.join(dir2, ".abort"), "");
 await Promise.race([p2, new Promise((_, rej) => setTimeout(() => rej(new Error("abort не сработал")), 10_000))]);
 console.log("e2e abort: OK");
+
+// watchdog-эскалация: .escalate-файл (пишет watchdog) останавливает крутящийся цикл,
+// stage=escalated с причиной, пользовательский notify не дублируется
+const dir3 = path.join(cwd, "T-esc");
+fs.mkdirSync(path.join(dir3, "round-1"), { recursive: true });
+const t3: TaskState = { id: "T-esc", dir: dir3, base_head: null, cwd, round: 1, stage: "worker", max_rounds: 1, history: [], agents: { worker: "w" }, started_at: "" };
+const n3: string[] = [];
+const p3 = runTask(t3, {
+	agents: [{ name: "w", role: "worker", surface: { kind: "tmux", target: "%9" } }],
+	sendTo: () => {}, alive: () => true, notify: (t) => n3.push(t),
+});
+await new Promise((r) => setTimeout(r, 2000)); // worker «зациклился» (done-файла нет)
+requestEscalation(t3, "нет нового прогресса 45 мин в этапе worker (nudge'ов: 2)");
+await Promise.race([p3, new Promise((_, rej) => setTimeout(() => rej(new Error("эскалация не сработала")), 10_000))]);
+assert.equal(t3.stage, "escalated", `T-esc stage=${t3.stage}`);
+assert.ok((t3.notes ?? "").includes("watchdog") && (t3.notes ?? "").includes("нет нового прогресса"), "T-esc notes: причина watchdog");
+assert.equal(n3.length, 0, "T-esc: двойного notify нет (уведомил watchdog)");
+console.log("e2e watchdog-escalation: OK");
 console.log("e2e: OK (" + sent.length + " сообщений, " + task.history.map((h) => h.verdict).join("→") + ")");
