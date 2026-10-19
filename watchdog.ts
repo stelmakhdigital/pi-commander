@@ -147,10 +147,10 @@ const MUTATING_TOOL = /^(write|edit)$/;
 const MUTATING_CMD =
 	/(^|\s)(tee|mv|cp|rm|touch|ln|chmod|chown|sed\s+-i|git\s+(add|commit|push|checkout|switch|restore|apply|merge|rebase|stash)|npm|npx|yarn|pnpm|node|bun|deno|make|pytest|cargo|go\s+build|just|pip\s+install|docker)(\s|$)/;
 
-function toolKey(c: { name: string; arguments?: Record<string, unknown> }): string {
+function toolKey(c: { name?: string; arguments?: Record<string, unknown> }): string {
 	const args = c.arguments ?? {};
 	const key = args.path ?? args.file_path ?? args.command ?? args.query ?? args.pattern ?? args.url ?? args.target ?? "";
-	return `${c.name}(${String(key).trim().slice(0, 120)})`;
+	return `${c.name ?? ""}(${String(key).trim().slice(0, 120)})`;
 }
 
 /** Последний jsonl в sessionDir: «read-loop»? true — если окно без мутаций и одно действие ≥ minFreq раз. */
