@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { buildBrief, buildDecomposeBrief, buildSliceBrief, isCycle, parseSlices, parseVerdict, readState, findQueuedTasks, findClaimingTasks, normalizeAgent, requestEscalation, readEscalation, type Agent, type Issue, type TaskState } from "../state.ts";
-import { Watchdog, taskSignature, sessionLoopDetect } from "../watchdog.ts";
+import { Watchdog, WD, wdConfig, taskSignature, sessionLoopDetect } from "../watchdog.ts";
 import { PROTOCOL } from "../protocol.ts";
 import { applyTemplate, listTemplates, TEMPLATES_DIR } from "../templates.ts";
 
@@ -105,6 +105,29 @@ assert.throws(() => applyTemplate("basic", proj), /task\.md/, "templates: пов
 assert.throws(() => applyTemplate("../templates", proj), /недопустимое имя/, "templates: выход за пределы templates/ запрещён");
 assert.throws(() => applyTemplate("no-such-template", proj), /не найден/, "templates: неизвестный шаблон");
 
+// watchdog: env PI_CMDER_* → пороги (lazy singleton; невалидные значения молча игнорируются),
+// конструктор-override сильнее env. Блок стоит до первого new Watchdog() в этом файле.
+process.env.PI_CMDER_TICK_MS = "1234";
+process.env.PI_CMDER_MAX_NUDGES = "7";
+process.env.PI_CMDER_SETTLED_MS = "555";
+process.env.PI_CMDER_NU_IDLE_MS = "не-число";
+process.env.PI_CMDER_NU_INTERVAL_MS = "12.5";
+process.env.PI_CMDER_RECENT_WINDOW = "";
+const wdEnv = new Watchdog();
+assert.equal(wdEnv.C.tickMs, 1234, "env: TICK_MS применён");
+assert.equal(wdEnv.C.maxNudges, 7, "env: MAX_NUDGES применён");
+assert.equal(wdEnv.C.settledMs, 555, "env: SETTLED_MS применён");
+assert.equal(wdEnv.C.nuIdleMs, WD.nuIdleMs, "env: невалидное значение → дефолт");
+assert.equal(wdEnv.C.nuIntervalMs, WD.nuIntervalMs, "env: дробное значение → дефолт");
+assert.equal(wdEnv.C.recentWindow, WD.recentWindow, "env: пустое значение → дефолт");
+assert.equal(wdConfig(), wdConfig(), "env: пороги читаются один раз (lazy singleton)");
+const wdPrio = new Watchdog({ tickMs: 42, maxNudges: 1 });
+assert.equal(wdPrio.C.tickMs, 42, "конструктор-override сильнее env: tickMs");
+assert.equal(wdPrio.C.maxNudges, 1, "конструктор-override сильнее env: maxNudges");
+assert.equal(wdPrio.C.settledMs, 555, "конструктор-override: без override берётся env");
+for (const k of ["PI_CMDER_TICK_MS", "PI_CMDER_MAX_NUDGES", "PI_CMDER_SETTLED_MS", "PI_CMDER_NU_IDLE_MS", "PI_CMDER_NU_INTERVAL_MS", "PI_CMDER_RECENT_WINDOW"])
+	delete process.env[k];
+
 // watchdog: без прогресса → nudge → авто-эскалация; есть прогресс → тишина
 const wdcwd = fs.mkdtempSync(path.join(os.tmpdir(), "commander-wd-"));
 const wdir = path.join(wdcwd, ".pi", "pipeline", "T-wd");
@@ -152,6 +175,38 @@ await sleepMs(5);
 wd.tick(wdcwd2, whooks2); // новая сигнатура = прогресс → не нуджим
 assert.equal(sent2.length, 0, "watchdog: прогресс (новый файл) — nudge не шлётся");
 assert.notEqual(taskSignature({ ...wtask2 }), "", "taskSignature: строка");
+
+// watchdog: правка содержимого существующего файла в каталоге задачи = новая сигнатура
+const wfile = path.join(wdir2, "round-1", "worker-report.md");
+const sigSame = taskSignature({ ...wtask2 });
+await sleepMs(5);
+fs.writeFileSync(wfile, "прогресс: дописал ещё работу"); // содержимое изменилось, новых файлов нет
+assert.notEqual(taskSignature({ ...wtask2 }), sigSame, "taskSignature: правка содержимого меняет сигнатуру");
+
+// watchdog: «пинг-понг» тем же содержимым (та же сигнатура) — прогрессом не считается
+const wdcwd4 = fs.mkdtempSync(path.join(os.tmpdir(), "commander-wd4-"));
+const wdir4 = path.join(wdcwd4, ".pi", "pipeline", "T-pp");
+fs.mkdirSync(path.join(wdir4, "round-1"), { recursive: true });
+const wtask4: TaskState = { ...wtask, id: "T-pp", dir: wdir4, cwd: wdcwd4 };
+fs.writeFileSync(path.join(wdir4, "state.json"), JSON.stringify(wtask4));
+const sent4: string[] = [];
+const whooks4 = { ...whooks, sendTo: (_a: Agent, l: string) => sent4.push(l) };
+const wdp = new Watchdog({ nuIdleMs: 0, nuIntervalMs: 0, hardIdleMs: 1e9, stageHardMs: 1e9, recentWindow: 10 });
+const ppFile = path.join(wdir4, "round-1", "worker-report.md");
+const stamp = new Date("2024-01-01T00:00:00Z");
+const writeSame = () => {
+	fs.writeFileSync(ppFile, "одно и то же содержимое");
+	fs.utimesSync(ppFile, stamp, stamp); // фиксированные mtime/size → сигнатура не меняется
+};
+wdp.tick(wdcwd4, whooks4); // инициализация наблюдения
+writeSame();
+await sleepMs(5);
+wdp.tick(wdcwd4, whooks4); // файл создан → новая сигнатура = прогресс
+assert.equal(sent4.length, 0, "ping-pong: новая сигнатура — прогресс, nudge нет");
+writeSame();
+await sleepMs(5);
+wdp.tick(wdcwd4, whooks4); // сигнатура уже была в окне → не прогресс → nudge
+assert.equal(sent4.length, 1, "ping-pong: то же содержимое — прогрессом не считается");
 
 // requestEscalation/readEscalation: round-trip
 assert.equal(readEscalation(wtask2), null, "readEscalation: без файла — null");

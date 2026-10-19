@@ -9,7 +9,9 @@
  *
  * Прогресс = «сигнатура» стадии, пересчитывается каждый тик:
  *  - git: status --porcelain + diff --stat HEAD в репо задачи (+ каждый worktree в sliced);
- *  - директория задачи: mtime+число файлов (артефакты, ask/answers-файлы).
+ *  - директория задачи: число файлов + max mtime и построчно (путь	mtime	размер) каждый файл
+ *    рекурсивно — правка содержимого существующего артефакта (например worker-progress.md)
+ *    меняет сигнатуру даже без создания новых файлов.
  * Сигнатура, уже встречавшаяся в последних recentWindow тиков, прогрессом НЕ
  * считается — защита от «пинг-понга» (агент по кругу правит одно и то же).
  * rpc-актёр: «turn уже завершился» (agent_settled) при отсутствии done-файла —
@@ -27,7 +29,7 @@ import { execFileSync } from "node:child_process";
 import { findActiveTasks, parseSlices, readEscalation, requestEscalation, saveState, type Agent, type TaskState } from "./state.ts";
 import { isRepo } from "./git.ts";
 
-/** Пороги (мс). В тестах переопределяются через конструктор. */
+/** Пороги (мс): дефолты. Переопределяются env PI_CMDER_* и конструктором Watchdog'а. */
 export const WD = {
 	tickMs: 30_000,
 	nuIdleMs: 15 * 60_000, // без нового прогресса → nudge
@@ -38,6 +40,35 @@ export const WD = {
 	recentWindow: 10, // окно дедупликации сигнатур
 	settledMs: 90_000, // agent_settled старше этого = turn завершён
 };
+
+/** env-переменная для каждого порога. */
+const WD_ENV: Record<keyof typeof WD, string> = {
+	tickMs: "PI_CMDER_TICK_MS",
+	nuIdleMs: "PI_CMDER_NU_IDLE_MS",
+	nuIntervalMs: "PI_CMDER_NU_INTERVAL_MS",
+	maxNudges: "PI_CMDER_MAX_NUDGES",
+	hardIdleMs: "PI_CMDER_HARD_IDLE_MS",
+	stageHardMs: "PI_CMDER_STAGE_HARD_MS",
+	recentWindow: "PI_CMDER_RECENT_WINDOW",
+	settledMs: "PI_CMDER_SETTLED_MS",
+};
+
+let wdCache: typeof WD | null = null;
+
+/** Пороги с учётом env (PI_CMDER_*): целые числа, читаются один раз (lazy singleton);
+ * невалидные/отсутствующие значения молча дают дефолт. Конструктор Watchdog'а сильнее env. */
+export function wdConfig(): typeof WD {
+	if (!wdCache) {
+		wdCache = { ...WD };
+		for (const k of Object.keys(WD_ENV) as Array<keyof typeof WD>) {
+			const raw = process.env[WD_ENV[k]];
+			if (!raw) continue;
+			const v = Number(raw.trim());
+			if (Number.isInteger(v)) (wdCache as Record<string, number>)[k] = v;
+		}
+	}
+	return wdCache;
+}
 
 export interface WatchdogHooks {
 	alive: (a: Agent) => boolean;
@@ -183,11 +214,14 @@ export function sessionLoopDetect(
 	return { loop: false };
 }
 
-/** Активность каталога: число файлов + max mtime (recursively; skipDirs — по имени). */
+/** Активность каталога: строка 1 — число файлов + max mtime, далее по строке на файл
+ * (путь\tmtime\tразмер, отсортировано по пути; рекурсивно; skipDirs — по имени).
+ * mtime+размер каждого файла в сигнатуре: правка содержимого существующего артефакта = прогресс. */
 function dirSig(dir: string, skipDirs: Set<string>): string {
 	let max = 0;
 	let n = 0;
-	const walk = (d: string) => {
+	const files: string[] = [];
+	const walk = (d: string, rel: string) => {
 		let es: fs.Dirent[];
 		try {
 			es = fs.readdirSync(d, { withFileTypes: true });
@@ -197,18 +231,19 @@ function dirSig(dir: string, skipDirs: Set<string>): string {
 		for (const e of es) {
 			if (e.isDirectory()) {
 				if (skipDirs.has(e.name)) continue;
-				walk(path.join(d, e.name));
+				walk(path.join(d, e.name), rel ? `${rel}/${e.name}` : e.name);
 			} else {
 				n++;
 				try {
-					const m = fs.statSync(path.join(d, e.name)).mtimeMs;
-					if (m > max) max = m;
+					const st = fs.statSync(path.join(d, e.name));
+					if (st.mtimeMs > max) max = st.mtimeMs;
+					files.push(`${rel ? `${rel}/` : ""}${e.name}\t${st.mtimeMs}\t${st.size}`);
 				} catch {}
 			}
 		}
 	};
-	walk(dir);
-	return `${n}:${max}`;
+	walk(dir, "");
+	return [`${n}:${max}`, ...files.sort()].join("\n");
 }
 
 /** Сигнатура стадии задачи: всё, что говорит «агент что-то меняет». */
@@ -233,10 +268,11 @@ interface WdTask {
 
 export class Watchdog {
 	private st = new Map<string, WdTask>();
-	private readonly C: typeof WD;
+	/** Действующие пороги: env (wdConfig) + override конструктора (сильнее env). Public — для тестов. */
+	readonly C: typeof WD;
 
 	constructor(cfg: Partial<typeof WD> = {}) {
-		this.C = { ...WD, ...cfg };
+		this.C = { ...wdConfig(), ...cfg };
 	}
 
 	/** Один тик по всем активным задачам cwd. */

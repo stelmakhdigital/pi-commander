@@ -28,7 +28,7 @@ import {
 	type TaskState,
 } from "./state.ts";
 import { isAlive as tmuxAlive, createWindow, createPane, sendLine } from "./tmux.ts";
-import { Watchdog, WD } from "./watchdog.ts";
+import { Watchdog, wdConfig } from "./watchdog.ts";
 import { PROTOCOL } from "./protocol.ts";
 import { applyTemplate, listTemplates } from "./templates.ts";
 
@@ -205,6 +205,7 @@ export default function commander(pi: ExtensionAPI) {
 		if (t.stage === "worker") return [regAgent(cwd, t.agents?.worker)].filter((a): a is Agent => !!a);
 		return [regAgent(cwd, t.agents?.planner)].filter((a): a is Agent => !!a); // decompose
 	};
+	const WD = wdConfig(); // пороги c учётом env PI_CMDER_*
 	const wd = new Watchdog();
 	const wdTimer = setInterval(() => {
 		const cwd = process.cwd();
