@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { buildBrief, buildDecomposeBrief, buildSliceBrief, isCycle, parseSlices, parseVerdict, readState, findQueuedTasks, findClaimingTasks, normalizeAgent, requestEscalation, readEscalation, type Agent, type Issue, type TaskState } from "../state.ts";
 import { Watchdog, WD, wdConfig, taskSignature, sessionLoopDetect } from "../watchdog.ts";
+import { LineBuffer } from "../rpc.ts";
+import { isClean, isRepo, statusSig } from "../git.ts";
 import { PROTOCOL } from "../protocol.ts";
 import { applyTemplate, listTemplates, TEMPLATES_DIR } from "../templates.ts";
 
@@ -110,6 +112,47 @@ assert.throws(() => applyTemplate("basic", proj), /task\.md/, "templates: пов
 assert.throws(() => applyTemplate("../templates", proj), /недопустимое имя/, "templates: выход за пределы templates/ запрещён");
 assert.throws(() => applyTemplate("no-such-template", proj), /не найден/, "templates: неизвестный шаблон");
 
+// rpc: JSONL-фрейминг — запись может прийти разрезанной по chunk'ам и посреди
+// UTF-8-символа; терялись события (watchdog не видел agent_settled)
+{
+	const lb = new LineBuffer();
+	const b = (s: string) => Buffer.from(s, "utf8");
+	assert.deepEqual(lb.push(b('{"a":')), [], "framing: неполная строка не отдаётся");
+	assert.deepEqual(lb.push(b('1}\n{"type":"agent_settled"}')), ['{"a":1}'], "framing: склейка по границе chunk'а, хвост остаётся");
+	assert.deepEqual(lb.push(b("\n")), ['{"type":"agent_settled"}'], "framing: хвост доезжает следующим chunk'ом");
+	const rec = JSON.stringify({ type: "x", text: "долгий русский текст ".repeat(20) });
+	const raw = b(rec + "\n");
+	// разрез ровно внутри многобайтного символа (байт продолжения UTF-8)
+	const cut = Math.max(1, raw.findIndex((x) => x >= 0x80 && x < 0xc0));
+	const lb2 = new LineBuffer();
+	assert.deepEqual(lb2.push(raw.subarray(0, cut)), [], "framing: разрез внутри UTF-8 — записи нет");
+	assert.deepEqual(lb2.push(raw.subarray(cut)), [rec], "framing: разрез внутри UTF-8 восстанавливается");
+}
+
+// git: .pi/ (состояние conductor'а) не считается работой агента — иначе после
+// первого же запуска дерево «не чистое» (slices недоступен), а watchdog видит прогресс
+{
+	const { execFileSync } = await import("node:child_process");
+	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "commander-git-"));
+	const g = (...a: string[]) => execFileSync("git", a, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	g("init", "-q", "-b", "main");
+	g("config", "user.email", "t@t");
+	g("config", "user.name", "t");
+	fs.writeFileSync(path.join(repo, "a.txt"), "a");
+	g("add", "-A");
+	g("commit", "-q", "-m", "base");
+	assert.ok(isRepo(repo), "git: isRepo");
+	assert.equal(isClean(repo), true, "git: чистое дерево");
+	// состояние conductor'а в .pi/pipeline (задачи, worktrees) — не грязь проекта
+	fs.mkdirSync(path.join(repo, ".pi", "pipeline", "T-1", "round-1"), { recursive: true });
+	fs.writeFileSync(path.join(repo, ".pi", "pipeline", "T-1", "state.json"), "{}");
+	assert.equal(isClean(repo), true, "git: .pi/pipeline не ломает «чистое дерево»");
+	assert.ok(!(await statusSig(repo)).includes(".pi/pipeline"), "git: .pi вне сигнатуры прогресса");
+	fs.writeFileSync(path.join(repo, "b.txt"), "b");
+	assert.equal(isClean(repo), false, "git: реальная правка — дерево грязное");
+	assert.ok((await statusSig(repo)).includes("b.txt"), "git: реальная правка видна в сигнатуре");
+}
+
 // watchdog: env PI_CMDER_* → пороги (lazy singleton; невалидные значения молча игнорируются),
 // конструктор-override сильнее env. Блок стоит до первого new Watchdog() в этом файле.
 process.env.PI_CMDER_TICK_MS = "1234";
@@ -148,7 +191,7 @@ const wd = new Watchdog({ nuIdleMs: 0, nuIntervalMs: 0, hardIdleMs: 400, stageHa
 const wactor: Agent = { name: "w1", role: "worker", surface: { kind: "rpc" } };
 const sent: string[] = [];
 const noted: string[] = [];
-const whooks = { alive: () => true, sendTo: (_a: Agent, l: string) => sent.push(l), notify: (t: string) => noted.push(t), settled: () => false, sessionDir: () => null, actors: () => [wactor], plannerOf: () => null };
+const whooks = { alive: () => true, sendTo: (_a: Agent, l: string) => sent.push(l), notify: (t: string) => noted.push(t), settledAgo: () => null as number | null, sessionDir: () => null, actors: () => [wactor], plannerOf: () => null };
 const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
 await wd.tick(wdcwd, whooks); // инициализация наблюдения
 await sleepMs(5);
@@ -215,6 +258,36 @@ await sleepMs(5);
 await wdp.tick(wdcwd4, whooks4); // сигнатура уже была в окне → не прогресс → nudge
 assert.equal(sent4.length, 1, "ping-pong: то же содержимое — прогрессом не считается");
 
+// watchdog: rpc-актёр завершил turn, а done-файла нет → нюдж без idle-порога,
+// а после исчерпания нюджей — эскалация (иначе «забыл финальный шаг» висит до 3 ч)
+const wdcwd5 = fs.mkdtempSync(path.join(os.tmpdir(), "commander-wd5-"));
+const wdir5 = path.join(wdcwd5, ".pi", "pipeline", "T-settled");
+fs.mkdirSync(path.join(wdir5, "round-1"), { recursive: true });
+const wtask5: TaskState = { ...wtask, id: "T-settled", dir: wdir5, cwd: wdcwd5 };
+fs.writeFileSync(path.join(wdir5, "state.json"), JSON.stringify(wtask5));
+const sent5: string[] = [];
+const noted5: string[] = [];
+const whooks5 = { ...whooks, sendTo: (_a: Agent, l: string) => sent5.push(l), notify: (t: string) => noted5.push(t), settledAgo: () => 10 * 60_000 };
+const wds = new Watchdog({ nuIdleMs: 1e9, nuIntervalMs: 0, hardIdleMs: 1e9, stageHardMs: 1e9, maxNudges: 1, settleStuckMs: 60_000 });
+await wds.tick(wdcwd5, whooks5); // инициализация
+await wds.tick(wdcwd5, whooks5); // settled 10 мин, done-файла нет → нюдж, idle-порог (1e9) не ждём
+assert.equal(sent5.length, 1, "settled: нюдж без idle-порога");
+assert.ok(sent5[0].includes("done-worker") && sent5[0].includes("turn уже завершён"), "settled: в нюдже финальный шаг и признак завершённого turn");
+await wds.tick(wdcwd5, whooks5); // нюджи исчерпаны → эскалация
+assert.equal(noted5.length, 1, "settled: после исчерпания нюджей — эскалация");
+assert.ok(noted5[0].includes("WATCHDOG") && readState(wdcwd5, "T-settled")?.stage === "escalated", "settled: stage=escalated");
+// тот жеsettled, но done-файл есть — тишина (работа сделана)
+const wdcwd6 = fs.mkdtempSync(path.join(os.tmpdir(), "commander-wd6-"));
+const wdir6 = path.join(wdcwd6, ".pi", "pipeline", "T-settled-ok");
+fs.mkdirSync(path.join(wdir6, "round-1"), { recursive: true });
+fs.writeFileSync(path.join(wdir6, "state.json"), JSON.stringify({ ...wtask5, id: "T-settled-ok", dir: wdir6, cwd: wdcwd6 }));
+fs.writeFileSync(path.join(wdir6, "round-1", "done-worker"), "");
+const sent6: string[] = [];
+const wds2 = new Watchdog({ nuIdleMs: 1e9, nuIntervalMs: 0, hardIdleMs: 1e9, stageHardMs: 1e9, maxNudges: 1, settleStuckMs: 60_000 });
+await wds2.tick(wdcwd6, { ...whooks5, sendTo: (_a: Agent, l: string) => sent6.push(l), notify: () => {} });
+await wds2.tick(wdcwd6, { ...whooks5, sendTo: (_a: Agent, l: string) => sent6.push(l), notify: () => {} });
+assert.equal(sent6.length, 0, "settled: done-файл есть — нюджа нет");
+
 // requestEscalation/readEscalation: round-trip
 assert.equal(readEscalation(wtask2), null, "readEscalation: без файла — null");
 requestEscalation(wtask2, "тест-причина");
@@ -247,7 +320,7 @@ const wtask3: TaskState = { ...wtask, id: "T-loop", dir: wdir3, cwd: wdcwd3 };
 fs.writeFileSync(path.join(wdir3, "state.json"), JSON.stringify(wtask3));
 const sent3: string[] = [];
 const noted3: string[] = [];
-const whooks3 = { alive: () => true, sendTo: (_a: Agent, l: string) => sent3.push(l), notify: (t: string) => noted3.push(t), settled: () => false, sessionDir: () => sessDir, actors: () => [wactor], plannerOf: () => null };
+const whooks3 = { alive: () => true, sendTo: (_a: Agent, l: string) => sent3.push(l), notify: (t: string) => noted3.push(t), settledAgo: () => null as number | null, sessionDir: () => sessDir, actors: () => [wactor], plannerOf: () => null };
 // в сессии снова только read-loop (обновим хвост без мутаций)
 fs.writeFileSync(sessFile, Array.from({ length: 20 }, () => toolLine("read", { path: "/proj/INSTRUCTIONS.md" })).join("\n") + "\n");
 await wd.tick(wdcwd3, whooks3); // инициализация

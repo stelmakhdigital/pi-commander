@@ -24,9 +24,14 @@ export function head(cwd: string): string | null {
 	}
 }
 
+/** .pi/ — состояние conductor'а (задачи, брифы, worktrees), а не работа агента.
+ *  Без исключения: после первого же запуска дерево переставало быть «чистым»
+ *  (slices больше не запускается), а watchdog считал чужие артефакты прогрессом. */
+const NOT_PI = ["--", ":(top,exclude).pi"];
+
 export function isClean(cwd: string): boolean {
 	try {
-		return git(cwd, "status", "--porcelain") === "";
+		return git(cwd, "status", "--porcelain", ...NOT_PI) === "";
 	} catch {
 		return false;
 	}
@@ -39,7 +44,7 @@ export function isClean(cwd: string): boolean {
 export function statusSig(cwd: string): Promise<string> {
 	const run = (args: string[]) =>
 		new Promise<string>((res) => execFile("git", args, { cwd, encoding: "utf8", timeout: 10_000, maxBuffer: 16 * 1024 * 1024 }, (_e, so) => res(_e ? "" : so)));
-	return Promise.all([run(["status", "--porcelain"]), run(["diff", "--stat", "HEAD"])]).then(([st, ds]) => st + "\n" + ds);
+	return Promise.all([run(["status", "--porcelain", ...NOT_PI]), run(["diff", "--stat", "HEAD", ...NOT_PI])]).then(([st, ds]) => st + "\n" + ds);
 }
 
 export const sliceBranch = (id: string, round: number, name: string) => `pipeline/${id}/r${round}-${name.replace(/[^\w.-]/g, "")}`;

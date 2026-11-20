@@ -14,8 +14,8 @@
  *    меняет сигнатуру даже без создания новых файлов.
  * Сигнатура, уже встречавшаяся в последних recentWindow тиков, прогрессом НЕ
  * считается — защита от «пинг-понга» (агент по кругу правит одно и то же).
- * rpc-актёр: «turn уже завершился» (agent_settled) при отсутствии done-файла —
- * сильный сигнал зацикливания, добавляется в текст nudge'а.
+ * rpc-актёр: «turn уже завершился» (agent_settled), а done-файла нет — самый частый
+ * стоп («забыл финальный шаг»): нюдж уходит по settleStuckMs, не дожидаясь idle-порога.
  * read-loop (rpc): хвост сессии (jsonl) без единого изменяющего tool-вызова и с одним
  * и тем же действием ≥ 6× в окне 30 — зацикливание ловится сразу (nudge/эскалация
  * не ждут idle-порогов), например «по кругу читает инструкции из файла».
@@ -39,6 +39,7 @@ export const WD = {
 	stageHardMs: 3 * 3_600_000, // этап длится дольше → эскалация даже при «прогрессе»
 	recentWindow: 10, // окно дедупликации сигнатур
 	settledMs: 90_000, // agent_settled старше этого = turn завершён
+	settleStuckMs: 3 * 60_000, // turn завершён, а done-файла нет столько → нюдж без idle-порога
 };
 
 /** env-переменная для каждого порога. */
@@ -51,6 +52,7 @@ const WD_ENV: Record<keyof typeof WD, string> = {
 	stageHardMs: "PI_CMDER_STAGE_HARD_MS",
 	recentWindow: "PI_CMDER_RECENT_WINDOW",
 	settledMs: "PI_CMDER_SETTLED_MS",
+	settleStuckMs: "PI_CMDER_SETTLE_STUCK_MS",
 };
 
 let wdCache: typeof WD | null = null;
@@ -76,8 +78,8 @@ export interface WatchdogHooks {
 	alive: (a: Agent) => boolean;
 	sendTo: (a: Agent, line: string) => void;
 	notify: (t: string) => void;
-	/** rpc-актёр: turn завершился (agent_settled), но done-файла нет? tmux — false. */
-	settled: (a: Agent) => boolean;
+	/** rpc-актёр: сколько мг назад завершился его turn (null — turn идёт или неизвестно, tmux). */
+	settledAgo: (a: Agent) => number | null;
 	/** Каталог сессий rpc-агента (для детекта зацикливания по tool-вызовам). tmux — null. */
 	sessionDir: (t: TaskState, a: Agent) => string | null;
 	/** Актуальные актёры задачи (по текущему stage; sliced round 1 — slice-агенты). */
@@ -129,6 +131,11 @@ export function pendingQa(t: TaskState): { ask: string; answers: string; done: s
 		}
 	}
 	return null;
+}
+
+/** Mid-round Q&A в этом этапе (worker задал вопрос, ждёт ответа planner'а)? */
+function qaWaiting(t: TaskState): boolean {
+	return t.stage === "worker" && pendingQa(t) !== null;
 }
 
 function gitSig(cwd: string): Promise<string> {
@@ -359,6 +366,25 @@ export class Watchdog {
 			}
 		}
 
+		// 2b) turn завершён, а done-файла нет: «забыл финальный шаг» — ждать 15 мин
+		// idle-порога смысла нет (после settle агент уже ничего не пишет).
+		// Q&A пропускаем: worker честно ждёт ответа planner'а, ему нюдж не адрес.
+		if (!qaWaiting(t) && now - w.lastNudgeAt >= this.C.nuIntervalMs) {
+			const stuck = this.settledActor(t, h);
+			if (stuck) {
+				if (w.nudges >= this.C.maxNudges) {
+					this.escalate(t, h, `агент ${stuck.actor.name} завершил turn ${stuck.settledMin} мин назад и не сделал финальный шаг`);
+					return;
+				}
+				try {
+					h.sendTo(stuck.actor, this.nudgeLine(t, stuck.actor, stuck.m, mins, true));
+					w.nudges++;
+					w.lastNudgeAt = now;
+				} catch {}
+				return;
+			}
+		}
+
 		// 3) nudge за отсутствие прогресса
 		if (idle < this.C.nuIdleMs || w.nudges >= this.C.maxNudges || now - w.lastNudgeAt < this.C.nuIntervalMs) return;
 		const sent = this.nudge(t, h, mins);
@@ -379,6 +405,18 @@ export class Watchdog {
 		return null;
 	}
 
+	/** Актёр, у которого turn давно завершён, а done-файла нет (rpc; tmux — settledAgo null). */
+	private settledActor(t: TaskState, h: WatchdogHooks): { actor: Agent; m: Markers; settledMin: number } | null {
+		for (const a of h.actors(t)) {
+			const age = h.settledAgo(a);
+			if (age === null || age < this.C.settleStuckMs || !h.alive(a)) continue;
+			const m = markersFor(t, a);
+			if (!m || fs.existsSync(m.done)) continue;
+			return { actor: a, m, settledMin: Math.round(age / 60000) };
+		}
+		return null;
+	}
+
 	private escalate(t: TaskState, h: WatchdogHooks, reason: string): void {
 		requestEscalation(t, reason);
 		t.stage = "escalated";
@@ -392,7 +430,7 @@ export class Watchdog {
 	/** Написать кому-то, кто сейчас «должен» продвинуть задачу. true = отправлено ≥1. */
 	private nudge(t: TaskState, h: WatchdogHooks, mins: number): boolean {
 		// Mid-round Q&A: ждём именно planner'а (worker в это время честно ждёт ответа).
-		const qa = t.stage === "worker" ? pendingQa(t) : null;
+		const qa = qaWaiting(t) ? pendingQa(t) : null;
 		if (qa) {
 			const planner = h.plannerOf(t);
 			if (planner && h.alive(planner)) {
@@ -411,7 +449,7 @@ export class Watchdog {
 			const m = markersFor(t, a);
 			if (!m || fs.existsSync(m.done) || !h.alive(a)) continue;
 			try {
-				h.sendTo(a, this.nudgeLine(t, a, m, mins, h.settled(a)));
+				h.sendTo(a, this.nudgeLine(t, a, m, mins, (h.settledAgo(a) ?? 0) > this.C.settledMs));
 				sent = true;
 			} catch {}
 		}

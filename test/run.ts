@@ -7,7 +7,5 @@ await import("./selfcheck.ts");
 await import("./e2e.ts");
 await import("./e2e-slices.ts");
 
-// смоук: индекс грузится и регистрирует инструменты (фейковый pi-хост)
-const { default: commander } = await import("../index.ts");
-commander({ registerTool() {}, on() {} } as never);
-console.log("index loads + registers OK");
+// инструменты index.ts на фейковом pi-хосте (он же смоук «индекс грузится и регистрирует»)
+await import("./tools.ts");

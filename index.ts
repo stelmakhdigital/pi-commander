@@ -172,10 +172,10 @@ export default function commander(pi: ExtensionAPI) {
 			alive,
 			notify,
 			sendTo: (a, l) => sendTo(a, l, cwd),
-			settled: (a) => {
-				if (a.surface.kind !== "rpc") return false;
-				const r = rpcAgents.get(a.name);
-				return !!r?.lastSettledAt && Date.now() - Date.parse(r.lastSettledAt) > WD.settledMs;
+			settledAgo: (a) => {
+				if (a.surface.kind !== "rpc") return null;
+				const s = rpcAgents.get(a.name)?.lastSettledAt;
+				return s ? Date.now() - Date.parse(s) : null;
 			},
 			sessionDir: (t, a) => {
 				if (a.surface.kind !== "rpc") return null;
@@ -327,7 +327,12 @@ export default function commander(pi: ExtensionAPI) {
 		async execute(_id, p, _signal, _u, ctx) {
 			const cwd = ctx.cwd || process.cwd();
 			const render = (t: TaskState) => {
-				const lines = [`${t.id}: stage=${t.stage} round=${t.round}/${t.max_rounds}${t.agents ? ` [${Object.values(t.agents).join(", ")}]` : ""}`];
+				const active = t.stage === "worker" || t.stage === "planner" || t.stage === "judge";
+				// сколько этап идёт — главный вопрос при «что там моя задача», и он же
+				// сигнал «пора смотреть» (watchdog эскалирует на hardIdle/stageHard)
+				const startedAt = active && t.stage_started_at ? Date.parse(t.stage_started_at) : NaN;
+				const age = Number.isFinite(startedAt) ? ` (${Math.max(0, Math.round((Date.now() - startedAt) / 60000))} мин в этапе)` : "";
+				const lines = [`${t.id}: stage=${t.stage} round=${t.round}/${t.max_rounds}${age}${t.agents ? ` [${Object.values(t.agents).join(", ")}]` : ""}`];
 				if (t.notes) lines.push(`notes: ${t.notes}`);
 				for (const h of t.history) lines.push(`round ${h.round}: ${h.verdict}${h.issues.length ? ` (${h.issues.length} issues)` : ""}${h.notes ? ` — ${h.notes}` : ""}`);
 				for (const e of fs.existsSync(t.dir) ? fs.readdirSync(t.dir, { withFileTypes: true }) : []) {
@@ -347,7 +352,13 @@ export default function commander(pi: ExtensionAPI) {
 			const done = taskHistory(cwd).filter((t) => !active.some((a) => a.id === t.id) && t.stage !== "queued").slice(-3);
 			if (!active.length && !queued.length && !done.length) return text("Задач нет.");
 			let out = active.length ? `Активные:\n\n${active.map(render).join("\n\n")}` : "Активных нет.";
-			if (queued.length) out += `\n\nВ очереди: ${queued.map((t) => `${t.id} [${Object.values(t.agents ?? {}).join(", ")}]${t.mode === "sliced" ? ` slices=${t.slice_count}` : ""}`).join(", ")}`;
+			// почему стоит в очереди — из-за какого агента и какой задачи (иначе «ждёт» ни о чём)
+			const whyQueued = (t: TaskState) => {
+				const busy = busyAgents(cwd, t.id);
+				const wait = [...new Set(Object.values(t.agents ?? {}).filter((n): n is string => !!n && busy.has(n)))].map((n) => `${n}: ${busy.get(n)}`);
+				return wait.length ? ` (ждёт: ${wait.join(", ")})` : "";
+			};
+			if (queued.length) out += `\n\nВ очереди: ${queued.map((t) => `${t.id} [${Object.values(t.agents ?? {}).join(", ")}]${t.mode === "sliced" ? ` slices=${t.slice_count}` : ""}${whyQueued(t)}`).join(", ")}`;
 			return text(out + (done.length ? `\n\nПоследние: ${done.map((t) => `${t.id} [${t.stage}] ${t.notes ?? ""}`).join("; ")}` : ""));
 		},
 		renderCall(args, theme) {

@@ -48,11 +48,13 @@ export function resolveAgents(pool: AgentPool, cwd: string, sel?: { worker?: str
 	return { agents, problems };
 }
 
-/** Конфликт-чек: агент уже занят в другой задаче (активной или в очереди). */
+/** Конфликт-чек: агент уже занят в другой задаче (активной или в очереди).
+ *  Метка приоритетная: активная задача видна вместо очереди (иначе «занят: T-queued»
+ *  скрывал бы, кто его реально держит). */
 export function busyAgents(cwd: string, exceptId?: string): Map<string, string> {
 	const busy = new Map<string, string>();
-	for (const t of findClaimingTasks(cwd)) {
-		if (t.id === exceptId) continue;
+	const tasks = findClaimingTasks(cwd).filter((t) => t.id !== exceptId);
+	for (const t of [...tasks.filter((x) => x.stage === "queued"), ...tasks.filter((x) => x.stage !== "queued")]) {
 		for (const [r, name] of Object.entries(t.agents ?? {})) if (name) busy.set(name, `${t.id} (${r})`);
 	}
 	return busy;
@@ -104,6 +106,9 @@ export function tickQueue(d: SchedulerDeps): void {
 			const busy = busyAgents(d.cwd, t.id);
 			if (agents.some((a) => busy.has(a.name))) continue; // ещё заняты — ждём
 			d.launched.add(t.id);
+			// без этого старт из очереди невидим: пользователь видел «поставлен в очередь»,
+			// а следующее сообщение — только финальный вердикт
+			d.notify(`[commander] ${t.id}: старт из очереди — round ${t.round} → ${t.mode === "sliced" ? "decompose" : "worker"}.`);
 			runTask(t, makeDeps(t, agents, d.pool, d.notify)).catch((err) => d.notify(`[commander] ${t.id}: ОШИБКА: ${(err as Error)?.message ?? err}`));
 		}
 	} catch (e) {
