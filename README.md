@@ -12,13 +12,11 @@ pi-пакет: связывает **зарегистрированные дол�
 - **Conductor** — это расширение в твоей основной pi-сессии. Детерминированный TS state machine, без LLM. Для tmux — одна строка-указатель на brief-файл (многострочный ввод ломал бы TUI); для RPC — prompt по JSONL.
 - **Сигнал готовности** этапа = done-файл на диске (часть протокола, а не транспорта) + валидный артефакт.
 - **Mid-round Q&A**: worker застрял без решения архитектора → `round-N/ask-worker.md` → conductor ретранслирует planner'у → `answers-<k>.md` → worker продолжает. Лимит 3 Q&A/этап (против зацикливания).
-- **Watchdog (анти-зацикливание)**: conductor каждые 30с смотрит на активные этапы по «сигнатуре» (git status/diff репо и worktrees + активность артефактов; повторная сигнатура прогрессом не считается). Без нового прогресса 15 мин → nudge агенту с явными выходами (done-файл / ask-файл / продолжить; максимум 2). Прогресса нет 45 мин или этап дольше 3 ч → **авто-эскалация задачи**: цикл останавливается, агенты освобождаются, ты получаешь `⚠ WATCHDOG` с причиной. Для rpc-агентов дополнительно читается лог сессии: если в последних 30 tool-вызовах нет ни одного изменяющего, а одно действие повторяется ≥ 6 раз (например «по кругу читает инструкции из файла») — nudge приходит сразу, без ожидания тайм-порогов; без реакции — эскалация.
+- **Watchdog (анти-зацикливание)**: каждые 30с сравнивает «сигнатуру прогресса» этапа (git status/diff + артефакты задачи). Без прогресса 15 мин → nudge агенту (максимум 2), 45 мин или этап дольше 3 ч → авто-эскалация. Для rpc-агентов читает лог сессии: повторяющееся действие ≥6 раз без единой мутации → nudge сразу. Пороги настраиваются env `PI_CMDER_*` (только положительные).
 - **Параллельность, три уровня:**
-  1. *Внутри раунда* — planner и judge не зависят друг от друга и работают одновременно (раунд = worker + max(planner, judge)).
-  2. *Между задачами* — агенты заняты? Задача встаёт в очередь (`stage=queued`) и стартует автоматически, как только её набор агентов освобождается (FIFO-планировщик). У каждой задачи свой набор агентов (`agents={worker, planner, judge}`).
-  3. *Внутри задачи (slices)* — `pipeline_run(spec, slices=N)`: planner дробит spec на 2..N независимых слайсов (`slices.json`), conductor поднимает под каждый слайс отдельного воркера в **git worktree** — все работают параллельно; conductor merge-ит слайсы, judge оценивает итоговый diff. Раунды 2+ (revise) — обычные. Требуется: git + чистое дерево + rpc-воркер (slice-воркеры conductor поднимает сам). Merge-конфликт — эскалация (worktrees остаются для ручного разрешения).
-- **Артефакты и контракты** — `.pi/pipeline/PROTOCOL.md` (пишется автоматически, bootstrap'ится в агентов при регистрации).
-
+  1. *Внутри раунда* — planner и judge работают одновременно.
+  2. *Между задачами* — занятые агенты? Задача стоит в очереди (`stage=queued`) и стартует автоматически (FIFO). У каждой задачи свой набор агентов.
+  3. *Внутри задачи (slices)* — `pipeline_run(spec, slices=N)`: planner дробит spec на 2..N слайсов, под каждый conductor поднимает отдельного rpc-воркера в git worktree, затем merge и оценка итогового diff. Раунды 2+ — обычный worker. Нужно: git, чистое дерево, rpc-воркер; merge-конфликт — эскалация (worktrees остаются).
 ```
 Ты ── pipeline_run(spec, agents?, slices?) ──► CONDUCTOR (extension, state machine)
                                         │ round N: worker → (planner ∥ judge)
@@ -44,31 +42,13 @@ pi-пакет: связывает **зарегистрированные дол�
 
 **0. Установить.** `~/.pi/agent/settings.json` → `packages` (см. Install ниже), перезапустить pi. Дальше всё через естественный язык в основной pi-сессии (в каталоге проекта).
 
-**1. Три агента.** Либо свои панели:
-
-```
-Зарегистрируй %12 как worker, %7 как planner, %15 как judge
-```
-
-`%12`, `%7`… — это **pane id** (номера панелей tmux), не придуманные номера. Узнать их — одна команда в любой панели (или за tmux):
-
-```bash
-tmux list-panes -s -F "#{pane_id}  #{pane_current_path}  #{pane_current_command}"
-```
-
-```
-%5   /home/you/Code/myproj   pi      ← вот тут живёт будущий worker
-%9   /home/you/Code/myproj   pi
-%14  /home/you/Code/other    bash
-```
-
-Берёшь `pane_id` (первая колонка) тех панелей, где запущены pi-сессии агентов. Подсказка: сам tmux показывает id в статус-баре (включить: `tmux set -g status-right '#{pane_id} '`), и по префиксу (`Ctrl+b`) → `?` видны клавиши управления панелями.
-
-А если агентов пока нет — ничего искать не нужно, conductor сам откроет панели с pi и id запомнит:
+**1. Три агента.** Быстрее всего — conductor сам откроет панели с pi:
 
 ```
 Зарегистрируй трёх агентов kind=tmux-auto: w1 — worker, p1 — planner, j1 — judge
 ```
+
+(альтернативы: `kind=tmux-split` — плитки в твоём окне; `kind=rpc` — без tmux вообще; `kind=tmux` — твоя уже открытая pi-сессия, нужен pane id из `tmux list-panes -s -F "#{pane_id} #{pane_current_path} #{pane_current_command}"`).
 
 Проверка: «Какие pipeline-агенты зарегистрированы?» → `pipeline_agents`, все с ✓.
 
@@ -154,13 +134,11 @@ Conductor вызовет `pipeline_template name=basic` и скопирует в
 
 ## Layout
 
-`.pi/pipeline/` — `registry.json`, `PROTOCOL.md`, `<T-id>/{spec.md, state.json, round-N/{brief-*, *report/decision/verdict, ask-worker-*, answers-*, done-*}}`, в sliced-режиме ещё `<T-id>/worktrees/<slice>` (чистятся по pass) и `round-1/slice-<k>/…`.
+`.pi/pipeline/` — `registry.json`, `PROTOCOL.md`, `<T-id>/{spec.md, state.json, round-N/{brief-*, *report/decision/verdict, ask-worker-*, answers-*, done-*}}`, в sliced-режиме ещё `<T-id>/worktrees/<slice>` (чистятся по pass и abort; при merge-конфликте остаются для ручного разрешения) и `round-1/slice-<k>/…`.
 
-## Тесты
+## Тесты и CI
 
-- `npm test` — selfcheck: cycle-detect, verdict-парсинг, parseSlices, brief'ы (обычные/decompose/slice), очередь и claiming, миграция реестра + загрузка расширения.
-- `npm run test:e2e` — полный цикл `runTask` с фейковыми агентами: Q&A в раунде 1, revise → pass в раунде 2, abort.
-- `npm run test:e2e:slices` — sliced-цикл в реальном git-репо: decompose → 2 воркера в worktrees → merge → pass → cleanup.
+`npm test` — полный гейт: `tsc --noEmit` (все модули, включая watchdog/rpc/git) + selfcheck (парсинг, cycle-detect, очереди/scheduler на фейковом транспорте, watchdog-сигнатуры) + e2e (`runTask`: Q&A, revise→pass, abort) + e2e-slices (реальный git: worktrees, merge, cleanup). Всё без tmux, сети и LLM. CI (GitHub Actions, ubuntu) гоняет `npm test`.
 
 ## Ограничения (v1)
 

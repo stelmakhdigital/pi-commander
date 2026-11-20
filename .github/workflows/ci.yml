@@ -1,0 +1,22 @@
+# Общий гейт: typecheck + selfcheck + e2e + e2e-slices (test/run.ts).
+# Тесты самодостаточные (jiti, фейковые агенты/репо во /tmp): без сети, tmux и моделей.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: typecheck + tests (node 22)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
