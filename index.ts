@@ -53,6 +53,13 @@ export default function commander(pi: ExtensionAPI) {
 	/** RPC-агенты живут в памяти сессии conductor'а (имена → процесс). */
 	const rpcAgents = new Map<string, RpcAgent>();
 
+	/** Убить процесс и забыть агента (перезапись регистрации, удаление из реестра,
+	 *  конец slice-воркера). Без этого процесс-сирота держит занятость невидимо. */
+	const dropRpc = (name: string): void => {
+		rpcAgents.get(name)?.kill();
+		rpcAgents.delete(name);
+	};
+
 	/** Единый sessionDir rpc-агента: и при регистрации, и при респауне, и у
 	 *  watchdog-детекта. Иначе --continue после респауна не находит сессий
 	 *  (молча теряется память), а read-loop детект смотрит в пустой каталог. */
@@ -134,9 +141,7 @@ export default function commander(pi: ExtensionAPI) {
 		},
 		// только slice-агенты (имя «T-.../slice»); зарегистрированные не убиваем
 		killAgent: (a) => {
-			if (!a.name.includes("/")) return;
-			rpcAgents.get(a.name)?.kill();
-			rpcAgents.delete(a.name);
+			if (a.name.includes("/")) dropRpc(a.name);
 		},
 	};
 
@@ -376,14 +381,12 @@ export default function commander(pi: ExtensionAPI) {
 				if (!p.pane) return text("Для kind=tmux нужен pane (например %12).");
 				if (!tmuxAlive(p.pane)) return text(`Панель ${p.pane} не найдена (tmux list-panes: проверь номер).`);
 				// перезапись rpc-регистрации tmux-панелью: процесс-сирота держит занятость невидимо
-				rpcAgents.get(p.name)?.kill();
-				rpcAgents.delete(p.name);
+				dropRpc(p.name);
 				surface = { kind: "tmux", target: p.pane };
 			} else if (kind === "tmux-auto" || kind === "tmux-split") {
 				const source = process.env.TMUX_PANE;
 				if (!source) return text("tmux-auto/split: pi не запущен внутри tmux (нет $TMUX_PANE). Возьми kind=tmux (свою панель) или kind=rpc.");
-				rpcAgents.get(p.name)?.kill();
-				rpcAgents.delete(p.name);
+				dropRpc(p.name);
 				try {
 					const pane = kind === "tmux-auto" ? createWindow(source, p.name, `pi '${boot}'`) : createPane(source, `pi '${boot}'`);
 					surface = { kind: "tmux", target: pane };
@@ -391,15 +394,14 @@ export default function commander(pi: ExtensionAPI) {
 					return text(`Не удалось открыть окно/панель: ${(e as Error).message}`);
 				}
 			} else {
+				// один путь подъёма rpc-процесса — ensureRpc (session-dir, resume, lazy-рестарт)
+				surface = { kind: "rpc", model: p.model, cwd: p.cwd ?? cwd };
 				try {
-					rpcAgents.get(p.name)?.kill();
-					const sessionDir = rpcSessionDir(cwd, p.name);
-					fs.mkdirSync(sessionDir, { recursive: true });
-					rpcAgents.set(p.name, new RpcAgent({ cwd: p.cwd ?? cwd, model: p.model, sessionDir, resume: dirHasSessions(sessionDir) }));
+					dropRpc(p.name);
+					ensureRpc({ name: p.name, role, surface }, cwd);
 				} catch (e) {
 					return text(`Не удалось поднять rpc-процесс: ${(e as Error).message}. Проверь, что \`pi\` в PATH.`);
 				}
-				surface = { kind: "rpc", model: p.model, cwd: p.cwd ?? cwd };
 			}
 			const reg = loadRegistry(cwd);
 			reg.agents = reg.agents.filter((a) => a.name !== p.name);
@@ -473,10 +475,7 @@ export default function commander(pi: ExtensionAPI) {
 						}
 					}
 				}
-				if (a.surface.kind === "rpc") {
-					rpcAgents.get(a.name)?.kill();
-					rpcAgents.delete(a.name);
-				}
+				if (a.surface.kind === "rpc") dropRpc(a.name);
 				reg.agents = reg.agents.filter((x) => x.name !== a.name);
 				out.push(`удалён: ${a.name} (${a.role}, ${surfaceStr(a)})`);
 			}

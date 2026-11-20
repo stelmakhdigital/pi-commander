@@ -131,39 +131,8 @@ export function readState(cwd: string, id: string): TaskState | null {
 const isActive = (s: TaskState) => s.stage === "worker" || s.stage === "planner" || s.stage === "judge";
 const isClaiming = (s: TaskState) => isActive(s) || s.stage === "queued";
 
-/** Задачи, уже крутящиеся (рестарт-эскалация, статус). */
-export function findActiveTasks(cwd: string): TaskState[] {
-	const root = PIPELINE_DIR(cwd);
-	if (!fs.existsSync(root)) return [];
-	const out: TaskState[] = [];
-	for (const e of fs.readdirSync(root, { withFileTypes: true })) {
-		if (!e.isDirectory() || !e.name.startsWith("T-")) continue;
-		const s = readState(cwd, e.name);
-		if (s && isActive(s)) out.push(s);
-	}
-	return out;
-}
-
-/** Задачи, претендующие на агентов (вкл. очередь) — для конфликт-чека. */
-export function findClaimingTasks(cwd: string): TaskState[] {
-	const root = PIPELINE_DIR(cwd);
-	if (!fs.existsSync(root)) return [];
-	const out: TaskState[] = [];
-	for (const e of fs.readdirSync(root, { withFileTypes: true })) {
-		if (!e.isDirectory() || !e.name.startsWith("T-")) continue;
-		const s = readState(cwd, e.name);
-		if (s && isClaiming(s)) out.push(s);
-	}
-	return out;
-}
-
-/** Очередь запуска: stage=queued, FIFO по времени создания. */
-export function findQueuedTasks(cwd: string): TaskState[] {
-	const out: TaskState[] = [];
-	for (const s of findClaimingTasks(cwd)) if (s.stage === "queued") out.push(s);
-	return out.sort((a, b) => a.started_at.localeCompare(b.started_at));
-}
-
+/** Все состояния задач проекта (каталог T-*), в порядке создания. Один обход —
+ *  остальные выборки это фильтры по нему. */
 export function taskHistory(cwd: string): TaskState[] {
 	const root = PIPELINE_DIR(cwd);
 	if (!fs.existsSync(root)) return [];
@@ -175,6 +144,15 @@ export function taskHistory(cwd: string): TaskState[] {
 	}
 	return out.sort((a, b) => a.started_at.localeCompare(b.started_at));
 }
+
+/** Задачи, уже крутящиеся (рестарт-эскалация, статус). */
+export const findActiveTasks = (cwd: string): TaskState[] => taskHistory(cwd).filter(isActive);
+
+/** Задачи, претендующие на агентов (вкл. очередь) — для конфликт-чека. */
+export const findClaimingTasks = (cwd: string): TaskState[] => taskHistory(cwd).filter(isClaiming);
+
+/** Очередь запуска: stage=queued, FIFO по времени создания. */
+export const findQueuedTasks = (cwd: string): TaskState[] => taskHistory(cwd).filter((s) => s.stage === "queued");
 
 /** Контент brief-файла для роли в текущем раунде. Только абсолютные пути. */
 export function buildBrief(task: TaskState, role: Role): string {
@@ -441,9 +419,26 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 		saveState(task);
 		return true;
 	};
+	/** Зависимости ожидания артефакта агента в текущем этапе: мягкий порог, abort,
+	 *  эскалация watchdog'а, живость актёра (одинаковы для всех этапов). */
+	const waitDeps = (agent: Agent, label: string): WaitDeps => ({
+		label,
+		softMs: STAGE_TIMEOUT_MS,
+		isAborted: aborted,
+		isEscalated: () => readEscalation(task) !== null,
+		isAlive: () => alive(agent),
+		notify,
+	});
 	/** Временные slice-агенты (убиваются в finally) и worktrees+ветки (чистятся по pass). */
 	const sliceAgents: Agent[] = [];
 	const cleanups: { wt: string; branch: string }[] = [];
+	/** Слайсовые worktrees и ветки: чистятся по pass и по abort. */
+	const cleanSlices = () => {
+		for (const c of cleanups) {
+			worktreeRemove(task.cwd, c.wt);
+			branchDelete(task.cwd, c.branch);
+		}
+	};
 
 	const sendStage = (agent: Agent, rd: string, briefName: string, content: string) => {
 		const bf = path.join(rd, briefName);
@@ -459,9 +454,7 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 		if (!alive(agent)) return { ok: false, reason: "dead" };
 		const rd = rdOf(task.round);
 		sendStage(agent, rd, "brief-planner.md", buildBrief(task, "planner"));
-		const r = await waitWhileAlive(() => fs.existsSync(path.join(rd, "done-planner")), {
-			label: `${task.id} planner ${agent.name}`, softMs: STAGE_TIMEOUT_MS, isAborted: aborted, isEscalated: () => readEscalation(task) !== null, isAlive: () => alive(agent), notify,
-		});
+		const r = await waitWhileAlive(() => fs.existsSync(path.join(rd, "done-planner")), waitDeps(agent, `${task.id} planner ${agent.name}`));
 		return { ok: r === "ok", reason: r };
 	};
 
@@ -472,7 +465,7 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 		if (!alive(agent)) return { fail: `агент ${agent.name} (judge): мёртв` };
 		const rd = rdOf(task.round);
 		sendStage(agent, rd, "brief-judge.md", buildBrief(task, "judge"));
-		const wv = { label: `${task.id} judge ${agent.name}`, softMs: STAGE_TIMEOUT_MS, isAborted: aborted, isEscalated: () => readEscalation(task) !== null, isAlive: () => alive(agent), notify };
+		const wv = waitDeps(agent, `${task.id} judge ${agent.name}`);
 		const r = await waitWhileAlive(() => fs.existsSync(path.join(rd, "done-judge")), wv);
 		if (r !== "ok") return { fail: r === "aborted" ? "aborted" : `агент ${agent.name} (judge): мёртв` };
 		const vf = path.join(rd, "judge-verdict.json");
@@ -503,9 +496,7 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 				sendStage(planner, rd, "brief-decompose.md", buildDecomposeBrief(task));
 				const sf = path.join(rd, "slices.json");
 				const maxS = task.slice_count ?? 6;
-				const dr = await waitWhileAlive(() => parseSlices(sf, maxS) !== null, {
-					label: `${task.id} decompose ${planner.name}`, softMs: STAGE_TIMEOUT_MS, isAborted: aborted, isEscalated: () => readEscalation(task) !== null, isAlive: () => alive(planner), notify,
-				});
+				const dr = await waitWhileAlive(() => parseSlices(sf, maxS) !== null, waitDeps(planner, `${task.id} decompose ${planner.name}`));
 				if (dr === "aborted") return;
 				if (dr === "escalated") { checkEsc(); return; }
 				if (dr !== "ok") return escalate(`planner не выдал валидный slices.json (${dr === "dead" ? `агент ${planner.name} умер` : "недопустимый формат: массив из 2..${maxS} объектов {name, scope, brief}"})`);
@@ -537,13 +528,13 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 				for (const r of wr) {
 					commitAll(r.wt!, `${task.id}: слайс ${r.s.name}`);
 					const m = merge(task.cwd, r.branch!, `${task.id}: слайс ${r.s.name}`);
-					if (!m.ok)
-						return escalate(
-							m.conflict
-								? `merge-конфликт слайса ${r.s.name} (ветка ${r.branch}): дерево восстановлено (merge --abort), разреши вручную, worktrees — ${path.join(task.dir, "worktrees")}`
-								: `merge упал не из-за конфликта: ${m.error}`,
-							);
-					}
+					if (m.ok) continue;
+					return escalate(
+						m.conflict
+							? `merge-конфликт слайса ${r.s.name} (ветка ${r.branch}): дерево восстановлено (merge --abort), разреши вручную, worktrees — ${path.join(task.dir, "worktrees")}`
+							: `merge упал не из-за конфликта: ${m.error}`,
+					);
+				}
 			} else {
 				// 1) worker (обычный)
 				setStage("worker");
@@ -577,13 +568,8 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 			task.history.push({ round: task.round, verdict: v.verdict, issues: v.issues, notes: v.notes });
 			saveState(task);
 			if (v.verdict === "pass") {
-				task.stage = "done";
-				task.stage_started_at = new Date().toISOString();
-				saveState(task);
-				for (const c of cleanups) {
-					worktreeRemove(task.cwd, c.wt);
-					branchDelete(task.cwd, c.branch);
-				}
+				setStage("done");
+				cleanSlices();
 				notify(`[commander] ${task.id}: PASS за ${task.round} раунд(ов).${v.notes ? ` Notes: ${v.notes}` : ""} История: ${task.dir}`);
 				return;
 			}
@@ -613,9 +599,6 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 	}
 	// abort: worktrees/ветки больше не нужны (при merge-конфликте — эскалация,
 	// она остаётся для ручного разрешения и сюда не доходит)
-	for (const c of cleanups) {
-		worktreeRemove(task.cwd, c.wt);
-		branchDelete(task.cwd, c.branch);
-	}
+	cleanSlices();
 	notify(`[commander] ${task.id}: aborted (остановлен пользователем).`);
 }
