@@ -12,21 +12,23 @@ import { loadRegistry, saveRegistry } from "./registry.ts";
 import { RpcAgent } from "./rpc.ts";
 import { head, isClean, isRepo } from "./git.ts";
 import {
+	ABORT_FILE,
 	PIPELINE_DIR,
 	ROLES,
+	atomicWrite,
 	findActiveTasks,
 	findClaimingTasks,
 	findQueuedTasks,
 	readState,
-	runTask,
+	requestEscalation,
 	saveState,
+	surfaceStr,
 	taskHistory,
 	type Agent,
-	type LoopDeps,
 	type Role,
-	type Slice,
 	type TaskState,
 } from "./state.ts";
+import { busyAgents, launchTask, resolveAgents, tickQueue, type AgentPool } from "./scheduler.ts";
 import { isAlive as tmuxAlive, createWindow, createPane, sendLine } from "./tmux.ts";
 import { Watchdog, wdConfig } from "./watchdog.ts";
 import { PROTOCOL } from "./protocol.ts";
@@ -35,11 +37,15 @@ import { applyTemplate, listTemplates } from "./templates.ts";
 export default function commander(pi: ExtensionAPI) {
 	const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: undefined });
 
-	/** Задачи, застрявшие в активной стадии из-за рестарта conductor'а → честная эскалация. */
+	/** Задачи, застрявшие в активной стадии из-за рестарта conductor'а → честная эскалация.
+	 *  Обязательно через requestEscalation (.escalate-файл): крутящийся zombie-runTask
+	 *  смотрит именно на файл, stage в state.json он затёр бы следующим setStage. */
 	try {
 		for (const t of findActiveTasks(process.cwd())) {
+			const note = "conductor перезапустился во время задачи — перезапусти (состояние: state.json)";
+			requestEscalation(t, note);
 			t.stage = "escalated";
-			t.notes = "conductor перезапустился во время задачи — перезапусти (состояние: state.json)";
+			t.notes = note;
 			saveState(t);
 		}
 	} catch {}
@@ -47,16 +53,28 @@ export default function commander(pi: ExtensionAPI) {
 	/** RPC-агенты живут в памяти сессии conductor'а (имена → процесс). */
 	const rpcAgents = new Map<string, RpcAgent>();
 
+	/** Единый sessionDir rpc-агента: и при регистрации, и при респауне, и у
+	 *  watchdog-детекта. Иначе --continue после респауна не находит сессий
+	 *  (молча теряется память), а read-loop детект смотрит в пустой каталог. */
+	const rpcSessionDir = (cwd: string, name: string): string => path.join(PIPELINE_DIR(cwd), "rpc", name, "sessions");
+	const dirHasSessions = (d: string): boolean => {
+		try {
+			return fs.readdirSync(d).length > 0;
+		} catch {
+			return false;
+		}
+	};
+
 	/** Lazy auto-respawn: мёртвый rpc-агент из реестра поднимается заново с --continue
 	 * (память в его собственном session-dir), если процесс уже был в этой сессии. */
 	const ensureRpc = (a: Agent, cwd: string): void => {
 		if (a.surface.kind !== "rpc") return;
 		if (a.name.includes("/")) return; // временные slice-агенты не респаунятся
 		if (rpcAgents.get(a.name)?.alive) return;
-		const sessionDir = path.join(PIPELINE_DIR(cwd), "rpc", a.name, "sessions");
+		const sessionDir = rpcSessionDir(cwd, a.name);
 		fs.mkdirSync(sessionDir, { recursive: true });
 		const hadBefore = rpcAgents.has(a.name);
-		rpcAgents.set(a.name, new RpcAgent({ cwd: a.surface.cwd ?? cwd, model: a.surface.model, sessionDir, resume: hadBefore }));
+		rpcAgents.set(a.name, new RpcAgent({ cwd: a.surface.cwd ?? cwd, model: a.surface.model, sessionDir, resume: hadBefore || dirHasSessions(sessionDir) }));
 	};
 
 	const alive = (a: Agent) => (a.surface.kind === "tmux" ? tmuxAlive(a.surface.target) : rpcAgents.get(a.name)?.alive ?? false);
@@ -85,110 +103,46 @@ export default function commander(pi: ExtensionAPI) {
 		} catch {}
 	};
 
-	const surfaceStr = (a: Agent) => (a.surface.kind === "tmux" ? `tmux ${a.surface.target}` : `rpc${a.surface.model ? ` ${a.surface.model}` : ""}`);
-
-	/** Разбор набора агентов задачи: явно (имена) или дефолтные (первые по ролям). */
-	const resolveAgents = (cwd: string, sel?: { worker?: string; planner?: string; judge?: string }): { agents: Agent[]; problems: string[] } => {
-		const reg = loadRegistry(cwd);
-		const problems: string[] = [];
-		const agents: Agent[] = [];
-		for (const r of ROLES) {
-			const name = sel?.[r];
-			const a = name ? reg.agents.find((x) => x.name === name) : reg.agents.find((x) => x.role === r);
-			if (a && a.surface.kind === "rpc") ensureRpc(a, cwd);
-			if (!a) {
-				problems.push(name ? `агент «${name}» не найден в реестре (роль ${r})` : `нет агента с ролью ${r} (pipeline_register)`);
-				continue;
-			}
-			if (!alive(a)) {
-				problems.push(`агент ${a.name} (${r}, ${surfaceStr(a)}): не жив`);
-				continue;
-			}
-			agents.push(a);
-		}
-		return { agents, problems };
+	/** Стоп задачи: out-of-band маркер + состояние. Общий путь pipeline_abort и force-remove. */
+	const stopTask = (t: TaskState, notes?: string): void => {
+		fs.writeFileSync(path.join(t.dir, ABORT_FILE), "");
+		t.stage = "aborted";
+		if (notes) t.notes = notes;
+		saveState(t);
 	};
 
-	/** Конфликт-чек: агент уже занят в другой задаче (активной или в очереди). */
-	const busyAgents = (cwd: string, exceptId?: string): Map<string, string> => {
-		const busy = new Map<string, string>();
-		for (const t of findClaimingTasks(cwd)) {
-			if (t.id === exceptId) continue;
-			for (const [r, name] of Object.entries(t.agents ?? {})) if (name) busy.set(name, `${t.id} (${r})`);
-		}
-		return busy;
+	/** Эскалация вне runTask (очередь и пр.): .escalate-файл + состояние + сигнал. */
+	const escalateTask = (t: TaskState, reason: string): void => {
+		requestEscalation(t, reason);
+		t.stage = "escalated";
+		t.notes = reason;
+		saveState(t);
+		notify(`[commander] ${t.id}: ESCALATION — ${reason}`);
 	};
 
-	/** Запуск runTask с зависимостями (единый путь: прямой запуск и очередь). */
+	/** Транспортный пул для планировщика/runTask: tmux + rpc-карта этой сессии. */
+	const pool: AgentPool = {
+		ensure: ensureRpc,
+		alive,
+		sendTo,
+		spawnSliceWorker: async (task, sl, wt, model) => {
+			const name = `${task.id}/${sl.name}`;
+			const sessionDir = path.join(task.dir, "sessions", sl.name);
+			fs.mkdirSync(sessionDir, { recursive: true });
+			rpcAgents.set(name, new RpcAgent({ cwd: wt, model, sessionDir }));
+			return { name, role: "worker" as const, surface: { kind: "rpc" as const, model } };
+		},
+		// только slice-агенты (имя «T-.../slice»); зарегистрированные не убиваем
+		killAgent: (a) => {
+			if (!a.name.includes("/")) return;
+			rpcAgents.get(a.name)?.kill();
+			rpcAgents.delete(a.name);
+		},
+	};
+
 	const launched = new Set<string>();
-	const launch = (task: TaskState, agents: Agent[], cwd: string) => {
-		launched.add(task.id);
-		const deps: LoopDeps = {
-			agents,
-			sendTo: (a, l) => sendTo(a, l, cwd),
-			alive,
-			notify,
-			spawnSliceWorker: async (_t, s: Slice, wt: string) => {
-				const name = `${task.id}/${s.name}`;
-				const worker = agents.find((a) => a.role === "worker");
-				const model = worker && worker.surface.kind === "rpc" ? worker.surface.model : undefined;
-				const sessionDir = path.join(task.dir, "sessions", s.name);
-				fs.mkdirSync(sessionDir, { recursive: true });
-				rpcAgents.set(name, new RpcAgent({ cwd: wt, model, sessionDir }));
-				return { name, role: "worker" as const, surface: { kind: "rpc" as const, model } };
-			},
-			killAgent: (a) => {
-				if (!a.name.startsWith(`${task.id}/`)) return;
-				rpcAgents.get(a.name)?.kill();
-				rpcAgents.delete(a.name);
-			},
-		};
-		runTask(task, deps).catch((err) => notify(`[commander] ${task.id}: ОШИБКА: ${(err as Error)?.message ?? err}`));
-	};
 
-	/** Очередь: queued-задача стартует, когда её набор агентов свободен (FIFO). */
-	const tickQueue = () => {
-		try {
-			const cwd = process.cwd();
-			for (const t of findQueuedTasks(cwd)) {
-				if (launched.has(t.id)) continue;
-				const reg = loadRegistry(cwd);
-				const agents: Agent[] = [];
-				const problems: string[] = [];
-				for (const r of ROLES) {
-					const name = t.agents?.[r];
-					const a = name ? reg.agents.find((x) => x.name === name) : reg.agents.find((x) => x.role === r);
-					if (!a) { problems.push(`нет агента «${name ?? r}» (роль ${r}) в реестре`); continue; }
-					if (a.surface.kind === "rpc") ensureRpc(a, cwd);
-					if (!alive(a)) { problems.push(`агент ${a.name} (${r}): не жив`); continue; }
-					agents.push(a);
-				}
-				if (problems.length) {
-					t.stage = "escalated";
-					t.notes = `очередь: ${problems.join("; ")}`;
-					saveState(t);
-					notify(`[commander] ${t.id}: ESCALATION — ${t.notes}`);
-					continue;
-				}
-				if (t.mode === "sliced") {
-					const w = agents.find((a) => a.role === "worker");
-					if (!w || w.surface.kind !== "rpc") {
-						t.stage = "escalated";
-						t.notes = "очередь: sliced-задача требует rpc-воркера";
-						saveState(t);
-						notify(`[commander] ${t.id}: ESCALATION — ${t.notes}`);
-						continue;
-					}
-				}
-				const busy = busyAgents(cwd, t.id);
-				if (agents.some((a) => busy.has(a.name))) continue; // ещё заняты — ждём
-				launch(t, agents, cwd);
-			}
-		} catch (e) {
-			notify(`[commander] очередь: ошибка: ${(e as Error).message ?? e}`);
-		}
-	};
-	const queueTimer = setInterval(tickQueue, 3000);
+	const queueTimer = setInterval(() => tickQueue({ cwd: process.cwd(), pool, launched, notify, escalate: escalateTask }), 3000);
 	queueTimer.unref();
 
 	/** Watchdog: зацикливание/простой агентов в активных этапах → nudge → авто-эскалация. */
@@ -221,13 +175,23 @@ export default function commander(pi: ExtensionAPI) {
 			sessionDir: (t, a) => {
 				if (a.surface.kind !== "rpc") return null;
 				if (a.name.includes("/")) return path.join(t.dir, "sessions", a.name.split("/").pop()!); // slice-агент
-				return path.join(PIPELINE_DIR(cwd), "rpc", a.name, "sessions");
+				return rpcSessionDir(cwd, a.name);
 			},
 			actors: (t) => wdActors(cwd, t),
 			plannerOf: (t) => regAgent(cwd, t.agents?.planner) ?? null,
 		});
 	}, WD.tickMs);
 	wdTimer.unref();
+
+	/** По докам pi (extensions.md) ресурсы сессии обязаны закрываться в
+	 *  session_shutdown: после /new, /resume, /reload создаётся новый инстанс,
+	 *  а старые таймеры и rpc-дети дали бы два conductor'а на одну задачу. */
+	pi.on("session_shutdown", () => {
+		clearInterval(queueTimer);
+		clearInterval(wdTimer);
+		for (const r of rpcAgents.values()) r.kill();
+		rpcAgents.clear();
+	});
 
 	pi.registerTool({
 		name: "pipeline_run",
@@ -248,7 +212,7 @@ export default function commander(pi: ExtensionAPI) {
 		}),
 		async execute(_id, p, _signal, _u, ctx) {
 			const cwd = ctx.cwd || process.cwd();
-			const { agents, problems } = resolveAgents(cwd, p.agents);
+			const { agents, problems } = resolveAgents(pool, cwd, p.agents);
 			if (problems.length) return text("Pipeline не запущен:\n- " + problems.join("\n- "));
 
 			let specText: string;
@@ -274,6 +238,8 @@ export default function commander(pi: ExtensionAPI) {
 			try {
 				base_head = head(cwd);
 			} catch {}
+			if (p.slices !== undefined && !base_head)
+				return text("slices: в репо нет ни одного коммита — worktree не от чего создать. Сделай базовый коммит.");
 
 			const root = PIPELINE_DIR(cwd);
 			ensureProtocol(cwd);
@@ -281,7 +247,7 @@ export default function commander(pi: ExtensionAPI) {
 			while (fs.existsSync(path.join(root, id))) id += "x"; // параллельный запуск в ту же секунду
 			const dir = path.join(root, id);
 			fs.mkdirSync(path.join(dir, "round-1"), { recursive: true });
-			fs.writeFileSync(path.join(dir, "spec.md"), specText.trimEnd() + "\n");
+			atomicWrite(path.join(dir, "spec.md"), specText.trimEnd() + "\n");
 
 			const task: TaskState = {
 				id,
@@ -298,7 +264,7 @@ export default function commander(pi: ExtensionAPI) {
 				started_at: new Date().toISOString(),
 				stage_started_at: new Date().toISOString(),
 			};
-			fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify(task, null, 2));
+			saveState(task);
 
 			const who = agents.map((a) => `${a.role}=${a.name}(${surfaceStr(a)})`).join(", ");
 			const busy = busyAgents(cwd, id);
@@ -308,7 +274,7 @@ export default function commander(pi: ExtensionAPI) {
 				saveState(task);
 				return text(`${id} поставлен в очередь (агенты заняты: ${conflicts.join(", ")}). Стартует автоматически, когда освободятся. Прогресс: pipeline_status.`);
 			}
-			launch(task, agents, cwd);
+			launchTask(task, agents, pool, notify, launched);
 			return text(`${id} запущен: round 1 → ${mode === "sliced" ? `decompose → ${sliceCount} slice-воркера (worktrees)` : "worker"}. Агенты: ${who}. Прогресс: pipeline_status. Результат придёт сообщением.`);
 		},
 		renderCall(args, theme) {
@@ -403,15 +369,22 @@ export default function commander(pi: ExtensionAPI) {
 			if (!ROLES.includes(role)) return text(`Неизвестная роль «${p.role}». Допустимо: ${ROLES.join(", ")}.`);
 			const kind = p.kind ?? "tmux";
 			let surface: Agent["surface"];
+			// bootstrap-строка одна на все kind (раньше была продублирована в двух местах)
+			const proto = ensureProtocol(cwd);
+			const boot = `[pipeline] Ты агент ${p.name} в pipeline, роль: ${role}. Прочитай ${proto} (раздел «${role}» + общие правила + §Q&A) и ответь одним словом «готов». Задачи будут приходить как [pipeline T-... R-n → ${role}].`;
 			if (kind === "tmux") {
 				if (!p.pane) return text("Для kind=tmux нужен pane (например %12).");
 				if (!tmuxAlive(p.pane)) return text(`Панель ${p.pane} не найдена (tmux list-panes: проверь номер).`);
+				// перезапись rpc-регистрации tmux-панелью: процесс-сирота держит занятость невидимо
+				rpcAgents.get(p.name)?.kill();
+				rpcAgents.delete(p.name);
 				surface = { kind: "tmux", target: p.pane };
 			} else if (kind === "tmux-auto" || kind === "tmux-split") {
 				const source = process.env.TMUX_PANE;
 				if (!source) return text("tmux-auto/split: pi не запущен внутри tmux (нет $TMUX_PANE). Возьми kind=tmux (свою панель) или kind=rpc.");
+				rpcAgents.get(p.name)?.kill();
+				rpcAgents.delete(p.name);
 				try {
-					const boot = `[pipeline] Ты агент ${p.name} в pipeline, роль: ${role}. Прочитай ${ensureProtocol(cwd)} (раздел «${role}» + общие правила + §Q&A) и ответь одним словом «готов». Задачи будут приходить как [pipeline T-... R-n → ${role}].`;
 					const pane = kind === "tmux-auto" ? createWindow(source, p.name, `pi '${boot}'`) : createPane(source, `pi '${boot}'`);
 					surface = { kind: "tmux", target: pane };
 				} catch (e) {
@@ -420,7 +393,9 @@ export default function commander(pi: ExtensionAPI) {
 			} else {
 				try {
 					rpcAgents.get(p.name)?.kill();
-					rpcAgents.set(p.name, new RpcAgent({ cwd: p.cwd ?? cwd, model: p.model }));
+					const sessionDir = rpcSessionDir(cwd, p.name);
+					fs.mkdirSync(sessionDir, { recursive: true });
+					rpcAgents.set(p.name, new RpcAgent({ cwd: p.cwd ?? cwd, model: p.model, sessionDir, resume: dirHasSessions(sessionDir) }));
 				} catch (e) {
 					return text(`Не удалось поднять rpc-процесс: ${(e as Error).message}. Проверь, что \`pi\` в PATH.`);
 				}
@@ -430,11 +405,9 @@ export default function commander(pi: ExtensionAPI) {
 			reg.agents = reg.agents.filter((a) => a.name !== p.name);
 			reg.agents.push({ name: p.name, role, surface });
 			saveRegistry(cwd, reg);
-			const proto = ensureProtocol(cwd);
-			const line = `[pipeline] Ты агент ${p.name} в pipeline, роль: ${role}. Прочитай ${proto} (раздел «${role}» + общие правила + §Q&A) и ответь одним словом «готов». Задачи будут приходить как [pipeline T-... R-n → ${role}].`;
-			// tmux-auto: bootstrap уже ушёл стартовым промптом панели, повторно не шлём
-			if (kind === "tmux") sendLine(p.pane!, line);
-			else rpcAgents.get(p.name)?.prompt(line);
+			// tmux-auto/split: bootstrap уже ушёл стартовым промптом панели, повторно не шлём
+			if (kind === "tmux") sendLine(p.pane!, boot);
+			else if (kind === "rpc") rpcAgents.get(p.name)?.prompt(boot);
 			return text(`Зарегистрирован: ${p.name} (${role}, ${surfaceStr({ name: p.name, role, surface })}). Bootstrap отправлен — проверь ответ «готов».`);
 		},
 		renderCall(args, theme) {
@@ -495,10 +468,7 @@ export default function commander(pi: ExtensionAPI) {
 				if (b) {
 					for (const t of findClaimingTasks(cwd)) {
 						if (Object.values(t.agents ?? {}).includes(a.name)) {
-							fs.writeFileSync(path.join(t.dir, ".abort"), "");
-							t.stage = "aborted";
-							t.notes = `агент ${a.name} удалён из реестра (force)`;
-							saveState(t);
+							stopTask(t, `агент ${a.name} удалён из реестра (force)`);
 							out.push(`задача ${t.id} остановлена (агент ${a.name} занят в ней)`);
 						}
 					}
@@ -552,11 +522,7 @@ export default function commander(pi: ExtensionAPI) {
 			const cwd = ctx.cwd || process.cwd();
 			const targets = p.id ? [readState(cwd, p.id)].filter((t): t is TaskState => !!t) : findClaimingTasks(cwd);
 			if (!targets.length) return text(p.id ? `Задача ${p.id} не найдена или не активна.` : "Активных задач нет.");
-			for (const t of targets) {
-				fs.writeFileSync(path.join(t.dir, ".abort"), ""); // крутящийся runTask видит по файлу
-				t.stage = "aborted";
-				saveState(t);
-			}
+			for (const t of targets) stopTask(t);
 			return text(`Aborted: ${targets.map((t) => t.id).join(", ")}. Агенты доделают текущий этап, цикл не продолжится.`);
 		},
 		renderCall(args, theme) {

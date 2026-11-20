@@ -66,6 +66,11 @@ fs.writeFileSync(sfile, JSON.stringify([{ name: "s1", brief: "A" }]));
 assert.equal(parseSlices(sfile, 6), null, "slices: 1 < 2 — нет");
 fs.writeFileSync(sfile, JSON.stringify([{ name: "a", brief: "x" }, { name: "b", brief: "y" }, { name: "c", brief: "z" }]));
 assert.equal(parseSlices(sfile, 2), null, "slices: 3 > max — нет");
+// имена уходят в путь worktree/ветку: путь наружу или ведущий '-' — отказ всей пачки
+fs.writeFileSync(sfile, JSON.stringify([{ name: "../evil", brief: "x" }, { name: "b", brief: "y" }]));
+assert.equal(parseSlices(sfile, 6), null, "slices: traversal-имя — отказ");
+fs.writeFileSync(sfile, JSON.stringify([{ name: "-o", brief: "x" }, { name: "b", brief: "y" }]));
+assert.equal(parseSlices(sfile, 6), null, "slices: имя-опция git — отказ");
 fs.writeFileSync(sfile, "nope");
 assert.equal(parseSlices(sfile, 6), null, "slices: не-JSON — нет");
 
@@ -113,19 +118,21 @@ process.env.PI_CMDER_SETTLED_MS = "555";
 process.env.PI_CMDER_NU_IDLE_MS = "не-число";
 process.env.PI_CMDER_NU_INTERVAL_MS = "12.5";
 process.env.PI_CMDER_RECENT_WINDOW = "";
+process.env.PI_CMDER_HARD_IDLE_MS = "0"; // 0 = каждый тик эскалировать; должно игнорироваться
 const wdEnv = new Watchdog();
 assert.equal(wdEnv.C.tickMs, 1234, "env: TICK_MS применён");
 assert.equal(wdEnv.C.maxNudges, 7, "env: MAX_NUDGES применён");
 assert.equal(wdEnv.C.settledMs, 555, "env: SETTLED_MS применён");
 assert.equal(wdEnv.C.nuIdleMs, WD.nuIdleMs, "env: невалидное значение → дефолт");
 assert.equal(wdEnv.C.nuIntervalMs, WD.nuIntervalMs, "env: дробное значение → дефолт");
+assert.equal(wdEnv.C.hardIdleMs, WD.hardIdleMs, "env: 0 → дефолт (нулевой порог запрещён)");
 assert.equal(wdEnv.C.recentWindow, WD.recentWindow, "env: пустое значение → дефолт");
 assert.equal(wdConfig(), wdConfig(), "env: пороги читаются один раз (lazy singleton)");
 const wdPrio = new Watchdog({ tickMs: 42, maxNudges: 1 });
 assert.equal(wdPrio.C.tickMs, 42, "конструктор-override сильнее env: tickMs");
 assert.equal(wdPrio.C.maxNudges, 1, "конструктор-override сильнее env: maxNudges");
 assert.equal(wdPrio.C.settledMs, 555, "конструктор-override: без override берётся env");
-for (const k of ["PI_CMDER_TICK_MS", "PI_CMDER_MAX_NUDGES", "PI_CMDER_SETTLED_MS", "PI_CMDER_NU_IDLE_MS", "PI_CMDER_NU_INTERVAL_MS", "PI_CMDER_RECENT_WINDOW"])
+for (const k of ["PI_CMDER_TICK_MS", "PI_CMDER_MAX_NUDGES", "PI_CMDER_SETTLED_MS", "PI_CMDER_NU_IDLE_MS", "PI_CMDER_NU_INTERVAL_MS", "PI_CMDER_RECENT_WINDOW", "PI_CMDER_HARD_IDLE_MS"])
 	delete process.env[k];
 
 // watchdog: без прогресса → nudge → авто-эскалация; есть прогресс → тишина
@@ -137,28 +144,28 @@ const wtask: TaskState = {
 	history: [], agents: { worker: "w1" }, started_at: "", stage_started_at: new Date().toISOString(),
 };
 fs.writeFileSync(path.join(wdir, "state.json"), JSON.stringify(wtask));
-const wd = new Watchdog({ nuIdleMs: 0, nuIntervalMs: 0, hardIdleMs: 30, stageHardMs: 1e9, recentWindow: 5 });
+const wd = new Watchdog({ nuIdleMs: 0, nuIntervalMs: 0, hardIdleMs: 400, stageHardMs: 1e9, recentWindow: 5 });
 const wactor: Agent = { name: "w1", role: "worker", surface: { kind: "rpc" } };
 const sent: string[] = [];
 const noted: string[] = [];
 const whooks = { alive: () => true, sendTo: (_a: Agent, l: string) => sent.push(l), notify: (t: string) => noted.push(t), settled: () => false, sessionDir: () => null, actors: () => [wactor], plannerOf: () => null };
 const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
-wd.tick(wdcwd, whooks); // инициализация наблюдения
+await wd.tick(wdcwd, whooks); // инициализация наблюдения
 await sleepMs(5);
-wd.tick(wdcwd, whooks); // прогресса нет → nudge №1
+await wd.tick(wdcwd, whooks); // прогресса нет → nudge №1
 assert.equal(sent.length, 1, "watchdog: nudge №1 отправлен");
 assert.ok(sent[0].includes("watchdog") && sent[0].includes("done-worker") && sent[0].includes("ask-worker.md"), "watchdog: в nudge'е выходы (done/ask)");
 await sleepMs(5);
-wd.tick(wdcwd, whooks); // → nudge №2 (максимум)
+await wd.tick(wdcwd, whooks); // → nudge №2 (максимум)
 assert.equal(sent.length, 2, "watchdog: nudge №2 отправлен");
-await sleepMs(40); // > hardIdleMs
-wd.tick(wdcwd, whooks); // → авто-эскалация, без новых сообщений
+await sleepMs(500); // > hardIdleMs
+await wd.tick(wdcwd, whooks); // → авто-эскалация, без новых сообщений
 assert.equal(sent.length, 2, "watchdog: после эскалации nudge'ов нет");
 assert.equal(noted.length, 1, "watchdog: эскалация уведомлена");
 assert.ok(noted[0].includes("WATCHDOG") && noted[0].includes("T-wd"), "watchdog: текст эскалации");
 assert.equal(readState(wdcwd, "T-wd")?.stage, "escalated", "watchdog: stage=escalated на диске");
 assert.ok(readEscalation(wtask), "watchdog: .escalate-файл с причиной");
-wd.tick(wdcwd, whooks); // после эскалации — тишина
+await wd.tick(wdcwd, whooks); // после эскалации — тишина
 assert.equal(noted.length, 1, "watchdog: дублей эскалации нет");
 
 // watchdog: файл изменился = прогресс, nudge не шлётся
@@ -169,19 +176,19 @@ const wtask2: TaskState = { ...wtask, id: "T-wd2", dir: wdir2, cwd: wdcwd2 };
 fs.writeFileSync(path.join(wdir2, "state.json"), JSON.stringify(wtask2));
 const sent2: string[] = [];
 const whooks2 = { ...whooks, sendTo: (_a: Agent, l: string) => sent2.push(l) };
-wd.tick(wdcwd2, whooks2); // инициализация (другая задача — отдельное состояние)
+await wd.tick(wdcwd2, whooks2); // инициализация (другая задача — отдельное состояние)
 fs.writeFileSync(path.join(wdir2, "round-1", "worker-report.md"), "прогресс");
 await sleepMs(5);
-wd.tick(wdcwd2, whooks2); // новая сигнатура = прогресс → не нуджим
+await wd.tick(wdcwd2, whooks2); // новая сигнатура = прогресс → не нуджим
 assert.equal(sent2.length, 0, "watchdog: прогресс (новый файл) — nudge не шлётся");
-assert.notEqual(taskSignature({ ...wtask2 }), "", "taskSignature: строка");
+assert.notEqual(await taskSignature({ ...wtask2 }), "", "taskSignature: строка");
 
 // watchdog: правка содержимого существующего файла в каталоге задачи = новая сигнатура
 const wfile = path.join(wdir2, "round-1", "worker-report.md");
-const sigSame = taskSignature({ ...wtask2 });
+const sigSame = await taskSignature({ ...wtask2 });
 await sleepMs(5);
 fs.writeFileSync(wfile, "прогресс: дописал ещё работу"); // содержимое изменилось, новых файлов нет
-assert.notEqual(taskSignature({ ...wtask2 }), sigSame, "taskSignature: правка содержимого меняет сигнатуру");
+assert.notEqual(await taskSignature({ ...wtask2 }), sigSame, "taskSignature: правка содержимого меняет сигнатуру");
 
 // watchdog: «пинг-понг» тем же содержимым (та же сигнатура) — прогрессом не считается
 const wdcwd4 = fs.mkdtempSync(path.join(os.tmpdir(), "commander-wd4-"));
@@ -198,14 +205,14 @@ const writeSame = () => {
 	fs.writeFileSync(ppFile, "одно и то же содержимое");
 	fs.utimesSync(ppFile, stamp, stamp); // фиксированные mtime/size → сигнатура не меняется
 };
-wdp.tick(wdcwd4, whooks4); // инициализация наблюдения
+await wdp.tick(wdcwd4, whooks4); // инициализация наблюдения
 writeSame();
 await sleepMs(5);
-wdp.tick(wdcwd4, whooks4); // файл создан → новая сигнатура = прогресс
+await wdp.tick(wdcwd4, whooks4); // файл создан → новая сигнатура = прогресс
 assert.equal(sent4.length, 0, "ping-pong: новая сигнатура — прогресс, nudge нет");
 writeSame();
 await sleepMs(5);
-wdp.tick(wdcwd4, whooks4); // сигнатура уже была в окне → не прогресс → nudge
+await wdp.tick(wdcwd4, whooks4); // сигнатура уже была в окне → не прогресс → nudge
 assert.equal(sent4.length, 1, "ping-pong: то же содержимое — прогрессом не считается");
 
 // requestEscalation/readEscalation: round-trip
@@ -243,8 +250,8 @@ const noted3: string[] = [];
 const whooks3 = { alive: () => true, sendTo: (_a: Agent, l: string) => sent3.push(l), notify: (t: string) => noted3.push(t), settled: () => false, sessionDir: () => sessDir, actors: () => [wactor], plannerOf: () => null };
 // в сессии снова только read-loop (обновим хвост без мутаций)
 fs.writeFileSync(sessFile, Array.from({ length: 20 }, () => toolLine("read", { path: "/proj/INSTRUCTIONS.md" })).join("\n") + "\n");
-wd.tick(wdcwd3, whooks3); // инициализация
-wd.tick(wdcwd3, whooks3); // loop сразу → nudge №1 (idle-пороги 15/45 мин не ждут)
+await wd.tick(wdcwd3, whooks3); // инициализация
+await wd.tick(wdcwd3, whooks3); // loop сразу → nudge №1 (idle-пороги 15/45 мин не ждут)
 assert.equal(sent3.length, 1, "loop: nudge сразу");
 assert.ok(sent3[0].includes("зациклился") && sent3[0].includes("INSTRUCTIONS.md"), "loop: текст nudge с деталями");
 assert.equal(noted3.length, 0, "loop: до эскалации notify нет");
@@ -259,6 +266,81 @@ try {
 	assert.deepEqual(applyTemplate("zz-selfcheck-tmp", proj2).copied, ["x.md"], "templates: новый шаблон копируется");
 } finally {
 	fs.rmSync(tmpT, { recursive: true });
+}
+
+// scheduler: tickQueue на фейковом транспорте (без tmux/rpc) — запуск из очереди
+// до pass и эскалация при мёртвом агенте. Шов AgentPool — цель выноса scheduler.ts.
+{
+	const { tickQueue } = await import("../scheduler.ts");
+	const { saveRegistry } = await import("../registry.ts");
+	const scwd = fs.mkdtempSync(path.join(os.tmpdir(), "commander-sched-"));
+	const mkTask = (id: string, agents: Record<string, string>) => {
+		const dir = path.join(scwd, ".pi", "pipeline", id);
+		fs.mkdirSync(path.join(dir, "round-1"), { recursive: true });
+		const t: TaskState = { id, dir, base_head: null, cwd: scwd, round: 1, stage: "queued", max_rounds: 3, history: [], agents: agents as TaskState["agents"], started_at: "", stage_started_at: new Date().toISOString() };
+		fs.writeFileSync(path.join(dir, "spec.md"), "# S\n## Критерии приёмки\n- x\n");
+		fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify(t));
+		return t;
+	};
+	// фейк-агент: на бриф пишет артефакт + done, вердикт всегда pass
+	const mkPool = (dead: string[] = []): import("../scheduler.ts").AgentPool => ({
+		ensure: () => {},
+		alive: (a) => !dead.includes(a.name),
+		sendTo: (a, line) => {
+			const rd = path.join(scwd, ".pi", "pipeline", line.match(/T-s\d/)![0], line.match(/round-\d+/)![0]);
+			fs.mkdirSync(rd, { recursive: true });
+			if (a.role === "worker") {
+				fs.writeFileSync(path.join(rd, "worker-report.md"), "# r\n## Статус: done\n");
+				fs.writeFileSync(path.join(rd, "done-worker"), "");
+			} else if (a.role === "planner") {
+				fs.writeFileSync(path.join(rd, "planner-decision.md"), "# r\n## Требования: нет\n");
+				fs.writeFileSync(path.join(rd, "done-planner"), "");
+			} else {
+				fs.writeFileSync(path.join(rd, "judge-verdict.json"), JSON.stringify({ verdict: "pass", issues: [] }));
+				fs.writeFileSync(path.join(rd, "done-judge"), "");
+			}
+		},
+		spawnSliceWorker: async () => { throw new Error("не для этого теста"); },
+		killAgent: () => {},
+	});
+	const reg3 = (w: string) => ({ agents: [
+		{ name: w, role: "worker" as const, surface: { kind: "tmux" as const, target: "%1" } },
+		{ name: "sp", role: "planner" as const, surface: { kind: "tmux" as const, target: "%2" } },
+		{ name: "sj", role: "judge" as const, surface: { kind: "tmux" as const, target: "%3" } },
+	] });
+	saveRegistry(scwd, reg3("sw"));
+	mkTask("T-s1", { worker: "sw", planner: "sp", judge: "sj" });
+	const escalated: string[] = [];
+	const schedDeps = (pool: import("../scheduler.ts").AgentPool, launched: Set<string>) =>
+		({ cwd: scwd, pool, launched, notify: () => {}, escalate: (t: TaskState, r: string) => { escalated.push(`${t.id}:${r}`); (t as any).stage = "escalated"; (t as any).notes = r; fs.writeFileSync(path.join(t.dir, "state.json"), JSON.stringify(t)); } });
+	tickQueue(schedDeps(mkPool(), new Set()));
+	// ждём завершения фонового runTask (фейки пишут артефакты синхронно — секунды)
+	let stage = "";
+	for (let k = 0; k < 100; k++) {
+		stage = readState(scwd, "T-s1")?.stage ?? "";
+		if (stage === "done" || stage === "escalated") break;
+		await new Promise((r) => setTimeout(r, 100));
+	}
+	assert.equal(stage, "done", "scheduler: очередь запустила живую задачу, цикл дошёл до pass");
+	// judge мёртв → эскалация без запуска
+	mkTask("T-s2", { worker: "sw", planner: "sp", judge: "sj" });
+	tickQueue(schedDeps(mkPool(["sj"]), new Set()));
+	assert.ok(escalated.some((e) => e.startsWith("T-s2:очередь:")), "scheduler: мёртвый агент → эскалация");
+	assert.equal(readState(scwd, "T-s2")?.stage, "escalated", "scheduler: снята с очереди эскалацией");
+	// уже запущенная (launched) не переэскалируется и не стартует второй раз
+	mkTask("T-s3", { worker: "sw", planner: "sp", judge: "sj" });
+	tickQueue(schedDeps(mkPool(["sj"]), new Set(["T-s3"])));
+	assert.equal(readState(scwd, "T-s3")?.stage, "queued", "scheduler: launched-задача не тронута");
+	// конфликт-чек: агенты заняты другой активной задачей → остаётся в очереди
+	const busyDir = path.join(scwd, ".pi", "pipeline", "T-busy");
+	fs.mkdirSync(path.join(busyDir, "round-1"), { recursive: true });
+	const busyTask: TaskState = { ...JSON.parse(fs.readFileSync(path.join(scwd, ".pi", "pipeline", "T-s2", "state.json"), "utf8")), id: "T-busy", dir: busyDir, stage: "worker", notes: "" };
+	fs.writeFileSync(path.join(busyDir, "state.json"), JSON.stringify(busyTask));
+	mkTask("T-s4", { worker: "sw", planner: "sp", judge: "sj" });
+	tickQueue(schedDeps(mkPool(), new Set()));
+	await new Promise((r) => setTimeout(r, 100));
+	assert.equal(readState(scwd, "T-s4")?.stage, "queued", "scheduler: занятые агенты — ждём освобождения");
+	fs.rmSync(scwd, { recursive: true });
 }
 
 console.log("selfcheck: OK");

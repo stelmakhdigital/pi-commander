@@ -25,9 +25,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { findActiveTasks, parseSlices, readEscalation, requestEscalation, saveState, type Agent, type TaskState } from "./state.ts";
-import { isRepo } from "./git.ts";
+import { isRepo, statusSig } from "./git.ts";
+import { MAX_QA_PER_STAGE } from "./state.ts";
 
 /** Пороги (мс): дефолты. Переопределяются env PI_CMDER_* и конструктором Watchdog'а. */
 export const WD = {
@@ -64,7 +64,9 @@ export function wdConfig(): typeof WD {
 			const raw = process.env[WD_ENV[k]];
 			if (!raw) continue;
 			const v = Number(raw.trim());
-			if (Number.isInteger(v)) (wdCache as Record<string, number>)[k] = v;
+			// только положительные: 0/отрицательное значение превратило бы каждый
+			// тик в авто-эскалацию (hardIdle=0) или выключило бы наблюдение
+			if (Number.isInteger(v) && v > 0) (wdCache as Record<string, number>)[k] = v;
 		}
 	}
 	return wdCache;
@@ -120,7 +122,7 @@ export function pendingQa(t: TaskState): { ask: string; answers: string; done: s
 			if (e.isDirectory() && e.name.startsWith("slice-")) dirs.push(path.join(rd, e.name));
 	}
 	for (const d of dirs) {
-		for (let k = 1; k <= 10; k++) {
+		for (let k = 1; k <= MAX_QA_PER_STAGE; k++) {
 			const ask = path.join(d, `ask-worker-${k}.md`);
 			const done = path.join(d, `answered-${k}`);
 			if (fs.existsSync(ask) && !fs.existsSync(done)) return { ask, answers: path.join(d, `answers-${k}.md`), done };
@@ -129,14 +131,9 @@ export function pendingQa(t: TaskState): { ask: string; answers: string; done: s
 	return null;
 }
 
-function gitSig(cwd: string): string {
-	try {
-		const st = execFileSync("git", ["status", "--porcelain"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-		const ds = execFileSync("git", ["diff", "--stat", "HEAD"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-		return (st + "\n" + ds).slice(0, 4000);
-	} catch {
-		return "";
-	}
+function gitSig(cwd: string): Promise<string> {
+	// см. statusSig в git.ts: async (не морозить event loop), без обрезки
+	return statusSig(cwd);
 }
 
 /* --- Детект зацикливания по логам сессий (rpc-агенты) ---
@@ -218,6 +215,9 @@ export function sessionLoopDetect(
  * (путь\tmtime\tразмер, отсортировано по пути; рекурсивно; skipDirs — по имени).
  * mtime+размер каждого файла в сигнатуре: правка содержимого существующего артефакта = прогресс. */
 function dirSig(dir: string, skipDirs: Set<string>): string {
+	// bookkeeping conductor'а/watchdog'а — не прогресс агента (иначе saveState/
+	// нюдж-маркеры сбрасывали idle-отсчёт ложным «прогрессом»)
+	const skipFiles = new Set(["state.json", ".escalate", ".abort", "spec.md"]);
 	let max = 0;
 	let n = 0;
 	const files: string[] = [];
@@ -232,7 +232,7 @@ function dirSig(dir: string, skipDirs: Set<string>): string {
 			if (e.isDirectory()) {
 				if (skipDirs.has(e.name)) continue;
 				walk(path.join(d, e.name), rel ? `${rel}/${e.name}` : e.name);
-			} else {
+			} else if (!skipFiles.has(e.name)) {
 				n++;
 				try {
 					const st = fs.statSync(path.join(d, e.name));
@@ -247,15 +247,16 @@ function dirSig(dir: string, skipDirs: Set<string>): string {
 }
 
 /** Сигнатура стадии задачи: всё, что говорит «агент что-то меняет». */
-export function taskSignature(t: TaskState): string {
+export async function taskSignature(t: TaskState): Promise<string> {
 	const parts: string[] = [`${t.stage}:${t.round}`, dirSig(t.dir, new Set(["worktrees", "sessions"]))];
-	if (isRepo(t.cwd)) parts.push(gitSig(t.cwd));
+	const sigs: Promise<string>[] = [];
+	if (isRepo(t.cwd)) sigs.push(gitSig(t.cwd));
 	if (t.mode === "sliced" && t.round === 1) {
 		const wtRoot = path.join(t.dir, "worktrees");
 		for (const e of fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot, { withFileTypes: true }) : [])
-			if (e.isDirectory()) parts.push(gitSig(path.join(wtRoot, e.name)));
+			if (e.isDirectory()) sigs.push(gitSig(path.join(wtRoot, e.name)));
 	}
-	return createHash("sha1").update(parts.join("\0")).digest("hex");
+	return Promise.all(sigs).then((extra) => createHash("sha1").update([...parts, ...extra].join("\0")).digest("hex"));
 }
 
 interface WdTask {
@@ -275,28 +276,44 @@ export class Watchdog {
 		this.C = { ...wdConfig(), ...cfg };
 	}
 
-	/** Один тик по всем активным задачам cwd. */
-	tick(cwd: string, h: WatchdogHooks): void {
-		const now = Date.now();
-		const active = findActiveTasks(cwd);
-		const ids = new Set(active.map((t) => t.id));
-		for (const k of [...this.st.keys()]) if (!ids.has(k)) this.st.delete(k);
-		for (const t of active) {
-			if (readEscalation(t)) continue;
-			try {
-				this.tickTask(t, h, now);
-			} catch {}
+	/** Один тик по всем активным задачам cwd. Async: git-вызовы не должны морозить
+	 *  event loop conductor'а; накладывающиеся тики отсекает флаг `ticking`. */
+	private ticking = false;
+	async tick(cwd: string, h: WatchdogHooks): Promise<void> {
+		if (this.ticking) return;
+		this.ticking = true;
+		try {
+			const now = Date.now();
+			const active = findActiveTasks(cwd);
+			const ids = new Set(active.map((t) => t.id));
+			for (const k of [...this.st.keys()]) if (!ids.has(k)) this.st.delete(k);
+			for (const t of active) {
+				if (readEscalation(t)) continue;
+				try {
+					await this.tickTask(t, h, now);
+				} catch (e) {
+					// тишина = слепой watchdog: сигналим один раз на новую ошибку
+					const msg = `${t.id}: ${(e as Error)?.message ?? e}`;
+					if (!this.errSeen.has(msg)) {
+						this.errSeen.add(msg);
+						h.notify(`[commander] watchdog: наблюдение ${t.id} сломалось — ${msg}`);
+					}
+				}
+			}
+		} finally {
+			this.ticking = false;
 		}
 	}
+	private errSeen = new Set<string>();
 
-	private tickTask(t: TaskState, h: WatchdogHooks, now: number): void {
+	private async tickTask(t: TaskState, h: WatchdogHooks, now: number): Promise<void> {
 		const key = `${t.stage}:${t.round}`;
 		let w = this.st.get(t.id);
+		const sig = await taskSignature(t);
 		if (!w || w.key !== key) {
-			this.st.set(t.id, { key, recent: [taskSignature(t)], lastChangeAt: now, nudges: 0, lastNudgeAt: 0 });
+			this.st.set(t.id, { key, recent: [sig], lastChangeAt: now, nudges: 0, lastNudgeAt: 0 });
 			return; // новый этап — наблюдать с чистого листа
 		}
-		const sig = taskSignature(t);
 		const fresh = !w.recent.includes(sig);
 		w.recent.push(sig);
 		if (w.recent.length > this.C.recentWindow) w.recent.shift();

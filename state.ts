@@ -73,15 +73,18 @@ export interface TaskState {
 
 export const PIPELINE_DIR = (cwd: string) => path.join(cwd, ".pi", "pipeline");
 
-const STATE_FILE = "state.json";
+/** Человекочитаемое описание транспорта агента. */
+export const surfaceStr = (a: Agent) => (a.surface.kind === "tmux" ? `tmux ${a.surface.target}` : `rpc${a.surface.model ? ` ${a.surface.model}` : ""}`);
+
+export const STATE_FILE = "state.json";
 /** Файл-маркер abort: pipeline_abort пишет его, крутящийся runTask видит (in-memory stage не обновляется). */
-const ABORT_FILE = ".abort";
+export const ABORT_FILE = ".abort";
 /** Файл-маркер эскалации watchdog'ом: причина в контенте, крутящийся runTask видит по нему. */
 const ESCALATE_FILE = ".escalate";
 
 export function requestEscalation(task: TaskState, reason: string): void {
 	fs.mkdirSync(task.dir, { recursive: true });
-	fs.writeFileSync(path.join(task.dir, ESCALATE_FILE), reason);
+	atomicWrite(path.join(task.dir, ESCALATE_FILE), reason);
 }
 
 export function readEscalation(task: TaskState): string | null {
@@ -101,8 +104,16 @@ export const MAX_QA_PER_STAGE = 3; // worker не должен зациклит�
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** tmp+rename: читатель никогда не увидит полустёртый JSON (torn-state терял
+ * задачу из watchdog'а и conflict-check'а). */
+export function atomicWrite(file: string, data: string): void {
+	const tmp = `${file}.${process.pid}.tmp`;
+	fs.writeFileSync(tmp, data);
+	fs.renameSync(tmp, file);
+}
+
 export function saveState(task: TaskState): void {
-	fs.writeFileSync(path.join(task.dir, STATE_FILE), JSON.stringify(task, null, 2));
+	atomicWrite(path.join(task.dir, STATE_FILE), JSON.stringify(task, null, 2));
 }
 
 export function readState(cwd: string, id: string): TaskState | null {
@@ -234,6 +245,9 @@ export function parseSlices(file: string, max: number): Slice[] | null {
 		const out = v
 			.filter((s) => s && typeof s === "object" && typeof s.name === "string" && s.name && typeof s.brief === "string" && s.brief)
 			.map((s) => ({ name: s.name, scope: typeof s.scope === "string" && s.scope ? s.scope : s.brief, brief: s.brief }));
+		// имя слайса уходит в путь worktree и имя ветки: первый символ — буква/цифра
+		// (запрещает «..», ведущую «-» = git-опция и «/» = путь наружу); иначе отказ
+		if (out.some((s) => !/^[\w][\w.-]*$/.test(s.name))) return null;
 		return out.length >= 2 && out.length <= max ? out : null;
 	} catch {
 		return null;
@@ -434,7 +448,7 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 	const sendStage = (agent: Agent, rd: string, briefName: string, content: string) => {
 		const bf = path.join(rd, briefName);
 		fs.mkdirSync(rd, { recursive: true });
-		fs.writeFileSync(bf, content);
+		atomicWrite(bf, content);
 		sendTo(agent, `[pipeline ${task.id} R${task.round} → ${agent.role}] Прочитай ${bf} и выполни, включая финальный шаг.`);
 	};
 
@@ -522,10 +536,14 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 				// 3) commit worktree'ов + merge в основное дерево
 				for (const r of wr) {
 					commitAll(r.wt!, `${task.id}: слайс ${r.s.name}`);
-					if (!merge(task.cwd, r.branch!, `${task.id}: слайс ${r.s.name}`)) {
-						return escalate(`merge-конфликт слайса ${r.s.name} (ветка ${r.branch}): разреши вручную, worktrees — ${path.join(task.dir, "worktrees")}`);
+					const m = merge(task.cwd, r.branch!, `${task.id}: слайс ${r.s.name}`);
+					if (!m.ok)
+						return escalate(
+							m.conflict
+								? `merge-конфликт слайса ${r.s.name} (ветка ${r.branch}): дерево восстановлено (merge --abort), разреши вручную, worktrees — ${path.join(task.dir, "worktrees")}`
+								: `merge упал не из-за конфликта: ${m.error}`,
+							);
 					}
-				}
 			} else {
 				// 1) worker (обычный)
 				setStage("worker");
@@ -585,8 +603,19 @@ export async function runTask(task: TaskState, deps: LoopDeps): Promise<void> {
 			task.round++;
 			saveState(task);
 		}
+	} catch (err) {
+		// любая вылетевшая ошибка (sendTo на мёртвом rpc, fs, баг хука) — честная
+		// эскалация с сохранением артефактов, а не зависший активный stage
+		escalate(`внутренняя ошибка цикла: ${(err as Error)?.message ?? err}`);
+		return;
 	} finally {
 		for (const a of sliceAgents) deps.killAgent?.(a);
+	}
+	// abort: worktrees/ветки больше не нужны (при merge-конфликте — эскалация,
+	// она остаётся для ручного разрешения и сюда не доходит)
+	for (const c of cleanups) {
+		worktreeRemove(task.cwd, c.wt);
+		branchDelete(task.cwd, c.branch);
 	}
 	notify(`[commander] ${task.id}: aborted (остановлен пользователем).`);
 }

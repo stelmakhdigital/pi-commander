@@ -8,9 +8,8 @@
 	"license": "MIT",
 	"type": "module",
 	"scripts": {
-		"test": "node -e \"import('jiti').then(async m => { const j = m.default(import.meta.url, { interopDefault: false }); await j.import('./test/selfcheck.ts'); const ext = await j.import('./index.ts'); ext.default({ registerTool(){} }); console.log('index loads + registers OK'); })\"",
-		"test:e2e": "node -e \"import('jiti').then(async m => { const j = m.default(import.meta.url, { interopDefault: false }); await j.import('./test/e2e.ts'); })\"",
-		"test:e2e:slices": "node -e \"import('jiti').then(async m => { const j = m.default(import.meta.url, { interopDefault: false }); await j.import('./test/e2e-slices.ts'); })\""
+		"typecheck": "tsc --noEmit",
+		"test": "npm run typecheck && node -e \"import('jiti').then(async m => { const j = m.default(import.meta.url, { interopDefault: false }); await j.import('./test/run.ts'); })\""
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
