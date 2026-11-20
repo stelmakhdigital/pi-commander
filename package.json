@@ -1,6 +1,6 @@
 {
 	"name": "commander",
-	"version": "0.3.0",
+	"version": "0.4.0",
 	"description": "pi-пакет: связывает зарегистрированные долгоживущие pi-агенты (tmux-панели и RPC-процессы) в цепочку worker→planner→judge с loop по вердикту судьи, mid-round Q&A, очередью задач и fan-out в git worktrees (slices) и шаблоны инициализации проекта (templates/)",
 	"keywords": [
 		"pi-package"
